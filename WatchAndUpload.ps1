@@ -114,8 +114,9 @@ $script:history  = New-Object 'System.Collections.Generic.HashSet[string]' ([Sys
 $script:retryMap = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::OrdinalIgnoreCase)
 $script:inFlight = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
-# Mutex for thread-safe DB access
-$script:dbMutex = New-Object System.Threading.Mutex($false, "GotohpDBMutex")
+# Mutex for thread-safe DB access (keyed to database path)
+$mutexName = "GotohpDBMutex_" + [Math]::Abs($script:DB.ToLower().GetHashCode())
+$script:dbMutex = New-Object System.Threading.Mutex($false, $mutexName)
 
 # ---------------------------------------------------------------------
 # PORTABLE PSSQLITE ENGINE LOADER (Zero configuration required)
@@ -199,14 +200,19 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
 function Write-Log([string]$msg, [string]$level = "INFO") {
     $ts   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$ts][$level] $msg"
+    $hasMutex = $false
     try {
-        $null = $script:dbMutex.WaitOne(3000)
-        Invoke-SqliteQuery -DataSource $script:DB `
-            -Query "INSERT INTO logs(level, message) VALUES(@lv, @m)" `
-            -SqlParameters @{ lv = $level; m = $msg } | Out-Null
+        $hasMutex = $script:dbMutex.WaitOne(3000)
+        if ($hasMutex) {
+            Invoke-SqliteQuery -DataSource $script:DB `
+                -Query "INSERT INTO logs(level, message) VALUES(@lv, @m)" `
+                -SqlParameters @{ lv = $level; m = $msg } | Out-Null
+        }
     } catch {}
     finally {
-        try { $script:dbMutex.ReleaseMutex() } catch {}
+        if ($hasMutex) {
+            try { $script:dbMutex.ReleaseMutex() } catch {}
+        }
     }
 
     switch ($level) {
@@ -244,66 +250,96 @@ function Load-Cache {
 }
 
 function Save-Upload([string]$path, [string]$mediaKey) {
+    $hasMutex = $false
     try {
-        $null = $script:dbMutex.WaitOne(3000)
-        Invoke-SqliteQuery -DataSource $script:DB `
-            -Query "INSERT OR REPLACE INTO uploads(path, media_key) VALUES(@p, @k)" `
-            -SqlParameters @{ p = $path; k = $mediaKey } | Out-Null
-        Invoke-SqliteQuery -DataSource $script:DB `
-            -Query "DELETE FROM retry_queue WHERE path = @p" `
-            -SqlParameters @{ p = $path } | Out-Null
-        $script:history.Add($path)     | Out-Null
+        $hasMutex = $script:dbMutex.WaitOne(3000)
+        if ($hasMutex) {
+            Invoke-SqliteQuery -DataSource $script:DB `
+                -Query "INSERT OR REPLACE INTO uploads(path, media_key) VALUES(@p, @k)" `
+                -SqlParameters @{ p = $path; k = $mediaKey } | Out-Null
+            Invoke-SqliteQuery -DataSource $script:DB `
+                -Query "DELETE FROM retry_queue WHERE path = @p" `
+                -SqlParameters @{ p = $path } | Out-Null
+        }
+        $script:history.Add($path) | Out-Null
         $null = $script:retryMap.Remove($path)
     } finally {
-        try { $script:dbMutex.ReleaseMutex() } catch {}
+        if ($hasMutex) {
+            try { $script:dbMutex.ReleaseMutex() } catch {}
+        }
     }
 }
 
 function Save-Retry([string]$path, [int]$attempts) {
+    $hasMutex = $false
     try {
-        $null = $script:dbMutex.WaitOne(3000)
-        Invoke-SqliteQuery -DataSource $script:DB `
-            -Query "INSERT OR REPLACE INTO retry_queue(path, attempts, last_attempt) VALUES(@p, @a, datetime('now','localtime'))" `
-            -SqlParameters @{ p = $path; a = $attempts } | Out-Null
+        $hasMutex = $script:dbMutex.WaitOne(3000)
+        if ($hasMutex) {
+            Invoke-SqliteQuery -DataSource $script:DB `
+                -Query "INSERT OR REPLACE INTO retry_queue(path, attempts, last_attempt) VALUES(@p, @a, datetime('now','localtime'))" `
+                -SqlParameters @{ p = $path; a = $attempts } | Out-Null
+        }
         $script:retryMap[$path] = $attempts
     } finally {
-        try { $script:dbMutex.ReleaseMutex() } catch {}
+        if ($hasMutex) {
+            try { $script:dbMutex.ReleaseMutex() } catch {}
+        }
     }
 }
 
 function Remove-Retry([string]$path) {
+    $hasMutex = $false
     try {
-        $null = $script:dbMutex.WaitOne(3000)
-        Invoke-SqliteQuery -DataSource $script:DB `
-            -Query "DELETE FROM retry_queue WHERE path = @p" `
-            -SqlParameters @{ p = $path } | Out-Null
+        $hasMutex = $script:dbMutex.WaitOne(3000)
+        if ($hasMutex) {
+            Invoke-SqliteQuery -DataSource $script:DB `
+                -Query "DELETE FROM retry_queue WHERE path = @p" `
+                -SqlParameters @{ p = $path } | Out-Null
+        }
         $null = $script:retryMap.Remove($path)
     } finally {
-        try { $script:dbMutex.ReleaseMutex() } catch {}
+        if ($hasMutex) {
+            try { $script:dbMutex.ReleaseMutex() } catch {}
+        }
     }
 }
 
 # ---------------------------------------------------------------------
-# FILE READINESS CHECK
+# FILE READINESS CHECK (Handles large files & active downloads)
 # ---------------------------------------------------------------------
 function Wait-ForFileReady([string]$path) {
+    if (-not [System.IO.File]::Exists($path)) { return "NOT_FOUND" }
+
+    $lastSize = -1
+
     for ($i = 0; $i -lt 30; $i++) {
         try {
-            if (-not [System.IO.File]::Exists($path)) { return $false }
+            if (-not [System.IO.File]::Exists($path)) { return "NOT_FOUND" }
             $info = New-Object System.IO.FileInfo($path)
+
             if ($info.Length -lt $script:MIN_BYTES) {
                 Start-Sleep -Seconds 1
                 continue
             }
+
+            # If file size is actively growing, it's still being downloaded/written
+            if ($info.Length -ne $lastSize) {
+                $lastSize = $info.Length
+                Start-Sleep -Seconds 2
+                continue
+            }
+
+            # Test exclusive read access to verify writer has closed the file handle
             $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'None')
             $fs.Close()
             $fs.Dispose()
-            return $true
+            return "READY"
         } catch {
+            # File is locked by writing process (browser, rendering engine, or copier)
             Start-Sleep -Seconds 2
         }
     }
-    return $false
+    return "LOCKED_OR_GROWING"
 }
 
 # ---------------------------------------------------------------------
@@ -330,11 +366,18 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
         Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Detected  : $name ($sizeLabel)" -ForegroundColor Cyan
         Write-Host "             Path      : $path"                               -ForegroundColor DarkGray
 
-        if (-not (Wait-ForFileReady $path)) {
-            Write-Log "File not ready or too small: $name" "WARN"
+        $status = Wait-ForFileReady $path
+        if ($status -ne "READY") {
+            if ($status -eq "NOT_FOUND") {
+                Remove-Retry $path
+                return
+            }
+
+            # File is actively downloading or locked by writer - keep in queue WITHOUT penalty
             $prev = 0
             if ($script:retryMap.ContainsKey($path)) { $prev = $script:retryMap[$path] }
-            Save-Retry $path ($prev + 1)
+            Write-Log "File still downloading or locked ($name) - remaining in queue for completion." "WARN"
+            Save-Retry $path $prev
             return
         }
 
@@ -370,15 +413,20 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
             [Console]::Write("`r  [$activeBar] Uploading $sizeLabel ($($elapsedSec)s)...   ")
         }
 
+        $stdout = $proc.StandardOutput.ReadToEnd()
         $proc.WaitForExit()
         $exitCode = $proc.ExitCode
         $totalTime = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
         $doneBar = "#" * $barWidth
 
         if ($exitCode -eq 0) {
+            $mediaKey = ""
+            if ($stdout -match '"mediaKey":\s*"([^"]+)"') {
+                $mediaKey = $matches[1]
+            }
             [Console]::Write("`r  [$doneBar] 100% [OK] Uploaded in $($totalTime)s: $name ($sizeLabel)        `n")
             Write-Log "SUCCESS | $name ($sizeLabel in $($totalTime)s)" "OK"
-            Save-Upload $path ""
+            Save-Upload $path $mediaKey
         } else {
             [Console]::Write("`r  [--------------------] FAILED in $($totalTime)s: $name                      `n")
             $attempts = 1
@@ -387,10 +435,10 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
             }
 
             if ($attempts -ge $script:MAX_RETRY) {
-                Write-Log "GAVE UP after $attempts attempts: $name" "ERROR"
+                Write-Log "GAVE UP after $attempts upload attempts: $name" "ERROR"
                 Remove-Retry $path
             } else {
-                Write-Log "FAILED (attempt $attempts/$($script:MAX_RETRY)) - queued for retry: $name" "WARN"
+                Write-Log "FAILED upload (attempt $attempts/$($script:MAX_RETRY)) - queued for retry: $name" "WARN"
                 Save-Retry $path $attempts
             }
         }
@@ -624,8 +672,12 @@ try {
                     continue
                 }
                 if ([System.IO.File]::Exists($qf)) {
-                    Write-Log "Retrying: $([System.IO.Path]::GetFileName($qf)) (attempt $($script:retryMap[$qf]+1))" "WARN"
-                    Invoke-Upload $qf 1 1
+                    if (-not $script:inFlight.Contains($qf)) {
+                        Invoke-Upload $qf 1 1
+                    }
+                } else {
+                    # File was deleted or moved - purge from retry queue
+                    Remove-Retry $qf
                 }
             }
         }
