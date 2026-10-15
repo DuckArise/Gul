@@ -13,14 +13,17 @@
 
 - **Unlimited Google Photos Backup**: Spoofs Google Pixel mobile upload API ([`xob0t/gotohp`](https://github.com/xob0t/gotohp)) so all uploaded photos and videos consume **0 bytes of Google Drive / Google One storage**.
 - **Cross-Platform (Windows & Linux)**: Native PowerShell engine on Windows and native POSIX Bash + `inotify` engine on Linux. No emulators or virtual machines.
-- **Dual-Boot Interoperability**: Windows and Linux scripts share the exact same SQLite database schema (`gphotos.db`), allowing shared partition or dual-boot setups to seamlessly avoid duplicate uploads.
+- **Dual-Boot Interoperability**: Windows and Linux scripts share the exact same SQLite database schema (`gphotos.db`), with dual-key lookups (`path` + `filename|filesize`) to seamlessly prevent duplicate uploads on shared partitions.
 - **Portable & Zero-Install**: Runs from any directory, on any PC or USB drive without system-wide installation.
+- **Unified 1-File Managers**:
+  - **Windows**: `GoogleUnlimited.bat` provides an interactive menu or CLI commands (`watch`, `silent`, `status`, `logs`, `enable`, `disable`, `stop`).
+  - **Linux**: `google-unlimited.sh` provides an interactive menu or CLI subcommands (`watch`, `status`, `logs`, `setup`, `enable`, `disable`, `stop`).
 - **Real-Time Auto-Sync**: Monitors standard user folders instantly when files are downloaded or saved, with debounce protection for active downloads.
 - **Embedded SQLite Tracking**: Tracks every upload in `gphotos.db` — zero duplicate re-uploads, crash-resilient with automatic retry queues.
-- **Live Terminal Progress Bar**: Interactive runner with real-time dynamic progress bar, elapsed timer, and file size indicator.
+- **Live Terminal Progress Bar**: Real-time dynamic progress bar, elapsed timer, and file size indicator.
 - **Background Auto-Start**: 
-  - Windows: 1-click installer (`EnableStartup.bat`) or silent VBScript launcher (`StartPhotosWatcher.vbs`).
-  - Linux: 1-click systemd user unit installer (`./enable_startup.sh`).
+  - Windows: 1-click startup installer or silent VBScript launcher (`StartPhotosWatcher.vbs`).
+  - Linux: 1-command user systemd service auto-start (`./google-unlimited.sh enable`).
 
 ---
 
@@ -36,28 +39,18 @@ GoogleUnlimited/
 ├── gotohp-x64.exe            # Windows desktop GUI for one-click Google OAuth sign-in
 ├── gotohp-cli_amd64          # Native Linux x86_64 ELF binary
 │
-│   # --- Windows Scripts ---
-├── RunWatcher.bat            # Windows interactive launcher (shows live progress)
+│   # --- Windows ---
+├── GoogleUnlimited.bat       # Unified Windows Manager (interactive menu + CLI commands)
 ├── StartPhotosWatcher.vbs    # Windows silent background launcher (zero window)
-├── EnableStartup.bat         # Windows 1-click auto-start on boot installer
-├── DisableStartup.bat        # Windows 1-click auto-start uninstaller
-├── StopWatcher.bat           # Stops running Windows background watcher
-├── ViewLogs.bat              # Displays recent sync activity logs
-├── CheckStatus.bat           # Shows upload statistics and retry queue
 ├── WatchAndUpload.ps1        # Core Windows PowerShell orchestrator
 │
-│   # --- Linux Scripts ---
-├── setup_linux.sh            # Linux 1-command installer (dependencies + binary + chmod)
-├── watch_and_upload.sh       # Core Linux Bash watcher (inotify + SQLite engine)
-├── enable_startup.sh         # Linux 1-click systemd user auto-start installer
-├── disable_startup.sh        # Linux 1-click systemd user auto-start uninstaller
-├── stop_watcher.sh           # Stops running Linux background watcher & inotifywait
-├── view_logs.sh              # Linux terminal activity log viewer with colors
-├── check_status.sh           # Linux terminal status & queue viewer
-├── google-unlimited.service  # systemd user service unit template
+│   # --- Linux ---
+├── google-unlimited.sh       # Unified Linux Manager (watcher, setup, status, systemd)
 │
+├── .gitattributes            # Line ending preservation (LF on shell scripts)
 ├── .gitignore                # Protects credentials, tokens, and personal databases
-└── README.md                 # Documentation
+├── README.md                 # Documentation
+└── reddit_showcase.jpg       # Showcase graphic
 ```
 
 ---
@@ -82,11 +75,32 @@ git clone https://github.com/shishir0x/GoogleUnlimited.git
 6. Once connected, your credentials are saved locally. Close the GUI.
 
 ### 3. Run on Windows
-- **Interactive Mode**: Double-click **`RunWatcher.bat`** (shows live progress bars).
-- **Background Mode**: Double-click **`StartPhotosWatcher.vbs`** (silent, zero window).
-- **Auto-Start on Boot**: Double-click **`EnableStartup.bat`** (or **`DisableStartup.bat`** to remove).
-- **Check Status / Logs**: Double-click **`CheckStatus.bat`** or **`ViewLogs.bat`**.
-- **Stop Watcher**: Double-click **`StopWatcher.bat`**.
+Double-click **`GoogleUnlimited.bat`** to open the interactive manager:
+```text
+==========================================================
+  *  Google Unlimited Photos Auto-Sync (Windows)
+==========================================================
+  [1] Start Live Watcher (Interactive progress)
+  [2] Start Background Watcher (Silent, zero window)
+  [3] Check Backup Status
+  [4] View Activity Logs
+  [5] Enable Auto-Start on Windows Boot
+  [6] Disable Auto-Start on Windows Boot
+  [7] Stop Background Watcher
+  [0] Exit
+==========================================================
+```
+
+You can also run any action directly from the terminal or shortcuts:
+```cmd
+GoogleUnlimited.bat watch     # Live terminal watcher with progress bar
+GoogleUnlimited.bat silent    # Silent background run (zero window)
+GoogleUnlimited.bat status    # Check total uploads and retry queue
+GoogleUnlimited.bat logs      # View last 30 sync activity logs
+GoogleUnlimited.bat enable    # Enable auto-start on Windows boot
+GoogleUnlimited.bat disable   # Disable auto-start on Windows boot
+GoogleUnlimited.bat stop      # Stop any running background watcher
+```
 
 ---
 
@@ -101,22 +115,17 @@ cd GoogleUnlimited
 ```
 
 ### 2. One-Command Setup
-Run the automated Linux setup script:
+Run setup to auto-install dependencies (`inotify-tools`, `sqlite3`, `curl`):
 ```bash
-chmod +x setup_linux.sh
-./setup_linux.sh
+chmod +x google-unlimited.sh
+./google-unlimited.sh setup
 ```
-What this does automatically:
-- Detects your package manager (`apt`, `dnf`, `pacman`, `zypper`) and installs `inotify-tools`, `sqlite3`, and `curl` if not already installed.
-- Detects your architecture (`x86_64` or `aarch64` / `arm64`) and ensures the proper native binary is ready.
-- Sets execute permissions (`chmod +x`) on all scripts.
 
 ### 3. Sign In (One-Time)
 Run:
 ```bash
-./gotohp-cli_amd64 creds add "<oauth_token>"
+./google-unlimited.sh creds add "<oauth_token>"
 ```
-*(If on ARM64, use `./gotohp-cli_arm64 creds add "<oauth_token>"`)*
 
 To get the `oauth_token`:
 1. In any web browser, open the Google Embedded Setup sign-in page.
@@ -124,40 +133,31 @@ To get the `oauth_token`:
 3. Under **Cookies** -> `https://accounts.google.com`, copy the **`oauth_token`** cookie value.
 
 ### 4. Run on Linux
-- **Interactive Mode**:
-  ```bash
-  ./watch_and_upload.sh
-  ```
-  Runs the startup scan (Phase 1) followed by real-time `inotify` monitoring (Phase 2).
+Run `./google-unlimited.sh` in your terminal to open the interactive manager:
+```text
+==========================================================
+  *  GoogleUnlimited - Linux Manager
+==========================================================
+  [1] Start Live Watcher (Foreground)
+  [2] Check Backup Status
+  [3] View Activity Logs
+  [4] Run Setup & Dependency Installer
+  [5] Enable Auto-Start on Boot (systemd)
+  [6] Disable Auto-Start on Boot
+  [7] Stop Background Watcher
+  [0] Exit
+==========================================================
+```
 
-- **Auto-Start on Boot (systemd user service)**:
-  ```bash
-  ./enable_startup.sh
-  ```
-  This creates, enables, and immediately starts a `systemd` user service (`google-unlimited.service`) that automatically launches the sync watcher on system boot and keeps it running quietly in the background.
-
-- **Check Status**:
-  ```bash
-  ./check_status.sh
-  ```
-  Displays total uploaded files, pending retries, and the last 10 uploads.
-
-- **View Activity Logs**:
-  ```bash
-  ./view_logs.sh
-  ```
-  Displays the last 30 timestamped activity events with color-coded log levels (`OK`, `WARN`, `ERROR`).
-
-- **Stop Watcher**:
-  ```bash
-  ./stop_watcher.sh
-  ```
-  Stops any running interactive or background watcher instances.
-
-- **Disable Startup Service**:
-  ```bash
-  ./disable_startup.sh
-  ```
+Or pass any command directly:
+```bash
+./google-unlimited.sh watch      # Interactive terminal with live progress
+./google-unlimited.sh enable     # Auto-start on boot via systemd user service
+./google-unlimited.sh disable    # Disable systemd startup service
+./google-unlimited.sh status     # View upload statistics and retry queue
+./google-unlimited.sh logs       # View recent activity logs with colors
+./google-unlimited.sh stop       # Terminate background watcher
+```
 
 ---
 
@@ -195,8 +195,8 @@ On Windows, directories are dynamically resolved via Windows Shell API & Registr
 ## Troubleshooting & Issues
 
 If you encounter any bugs, unexpected behavior, or need help:
-- Run `./check_status.sh` (Linux) or `CheckStatus.bat` (Windows) to check queue and database status.
-- Run `./view_logs.sh` (Linux) or `ViewLogs.bat` (Windows) to inspect error details.
+- Run `./google-unlimited.sh status` (Linux) or `GoogleUnlimited.bat status` (Windows) to check queue and database status.
+- Run `./google-unlimited.sh logs` (Linux) or `GoogleUnlimited.bat logs` (Windows) to inspect error details.
 - Please submit an issue on the GitHub repository:  
   👉 **[Report an Issue on GitHub](https://github.com/shishir0x/GoogleUnlimited/issues)**
 

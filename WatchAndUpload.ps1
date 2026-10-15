@@ -5,7 +5,10 @@
 # =====================================================================
 param(
     [switch]$StatusOnly,
-    [switch]$ShowLogs
+    [switch]$ShowLogs,
+    [switch]$EnableStartup,
+    [switch]$DisableStartup,
+    [switch]$StopWatcher
 )
 $ErrorActionPreference = "Stop"
 
@@ -506,6 +509,56 @@ foreach ($dir in $script:WATCH_DIRS) {
 }
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host ""
+
+if ($StopWatcher) {
+    Write-Host "Stopping Google Photos background watcher..." -ForegroundColor Cyan
+    $currentPid = $PID
+    $stopped = 0
+    Get-CimInstance Win32_Process | Where-Object {
+        $_.ProcessId -ne $currentPid -and
+        $_.CommandLine -and
+        ($_.CommandLine -like "*WatchAndUpload.ps1*" -or $_.CommandLine -like "*StartPhotosWatcher.vbs*")
+    } | ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host "[OK] Stopped watcher (PID $($_.ProcessId))" -ForegroundColor Green
+        $stopped++
+    }
+    if ($stopped -gt 0) {
+        Write-Host "All background watcher instances have been stopped." -ForegroundColor Green
+    } else {
+        Write-Host "No active background watcher instances found running." -ForegroundColor Yellow
+    }
+    return
+}
+
+if ($EnableStartup) {
+    Write-Host "Setting up Google Photos Auto-Sync to run on Windows startup..." -ForegroundColor Cyan
+    $startupFolder = [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
+    $shortcutPath = Join-Path $startupFolder "GoogleUnlimited.lnk"
+    $vbsPath = Join-Path $script:BASE "StartPhotosWatcher.vbs"
+    $ws = New-Object -ComObject WScript.Shell
+    $s = $ws.CreateShortcut($shortcutPath)
+    $s.TargetPath = $vbsPath
+    $s.WorkingDirectory = $script:BASE
+    $s.Description = "Google Photos Unlimited Auto-Sync Watcher"
+    $s.Save()
+    Write-Host "[OK] Startup shortcut created: $shortcutPath" -ForegroundColor Green
+    Write-Host "Google Photos Auto-Sync will now start automatically in the background on boot." -ForegroundColor Yellow
+    return
+}
+
+if ($DisableStartup) {
+    Write-Host "Removing Google Photos Auto-Sync from Windows startup..." -ForegroundColor Cyan
+    $startupFolder = [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
+    $shortcutPath = Join-Path $startupFolder "GoogleUnlimited.lnk"
+    if ([System.IO.File]::Exists($shortcutPath)) {
+        Remove-Item -LiteralPath $shortcutPath -Force
+        Write-Host "[OK] Startup shortcut removed successfully." -ForegroundColor Green
+    } else {
+        Write-Host "Startup shortcut was not present." -ForegroundColor Yellow
+    }
+    return
+}
 
 if (-not [System.IO.File]::Exists($script:GOTOHP)) {
     Write-Host "ERROR: gotohp binary not found in $script:BASE or system PATH." -ForegroundColor Red
