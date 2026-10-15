@@ -53,7 +53,6 @@ git clone https://github.com/shishir0x/GoogleUnlimited.git
 
 To spoof Google Pixel unlimited backup, `gotohp` authenticates via Google's Embedded Setup token:
 
-#### Option 1 — GUI Setup (Recommended)
 1. Double-click **`gotohp-x64.exe`** and click **Add Google account**.
 2. Click **Open Google sign-in** and sign in with the Google account you want to use.
 3. Sign in on the Google Embedded Setup page and click **I agree**.  
@@ -64,12 +63,6 @@ To spoof Google Pixel unlimited backup, `gotohp` authenticates via Google's Embe
    - Find the cookie named **`oauth_token`** and copy only its value.
 5. Return to **`gotohp`**, paste the token value into the input field, and click **Connect account**.
 6. Once connected, your auth is securely saved locally. You can now close the GUI window.
-
-#### Option 2 — CLI Setup
-From the command line, open the Embedded Setup sign-in page, retrieve the `oauth_token` using the steps above, and run:
-```cmd
-.\gotohp-cli-x64.exe creds add "<oauth_token value>"
-```
 
 ### 3. Start Syncing
 Choose how you want to run it:
