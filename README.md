@@ -122,15 +122,34 @@ chmod +x google-unlimited.sh
 ```
 
 ### 3. Sign In (One-Time)
-Run:
-```bash
-./google-unlimited.sh creds add "<oauth_token>"
-```
 
-To get the `oauth_token`:
-1. In any web browser, open the Google Embedded Setup sign-in page.
-2. Sign in and open browser Developer Tools (**F12**).
-3. Under **Cookies** -> `https://accounts.google.com`, copy the **`oauth_token`** cookie value.
+You have two simple ways to sign in on Linux:
+
+#### Option A: Retrieve `oauth_token` via Browser
+1. In any web browser, open the Google Embedded Setup sign-in page:  
+   👉 **[https://accounts.google.com/embedded/setup/v2/android](https://accounts.google.com/embedded/setup/v2/android)**
+2. Sign in with your Google account and click **I agree**.  
+   *(The screen may stay loading/buffering indefinitely; this is expected).*
+3. Press **F12** (or right-click → **Inspect**) to open browser Developer Tools:
+   - Click the **Application** tab (Chrome / Brave / Edge) or **Storage** tab (Firefox).
+   - In the left sidebar, expand **Cookies** → click `https://accounts.google.com`.
+   - Find the cookie named **`oauth_token`** and copy its full value.
+4. In your Linux terminal, run:
+   ```bash
+   ./google-unlimited.sh creds add "<oauth_token>"
+   ```
+5. Verify your active account:
+   ```bash
+   ./google-unlimited.sh creds list
+   ```
+
+#### Option B: Copy from Windows (Fastest for Dual-Boot / Shared Drives)
+If you already signed in on Windows:
+Simply copy the generated `gotohp.config` file from your Windows folder into your Linux project directory:
+```bash
+cp /path/to/windows/GoogleUnlimited/gotohp.config ~/GoogleUnlimited/
+```
+The Linux watcher will detect `gotohp.config` and authenticate automatically.
 
 ### 4. Run on Linux
 Run `./google-unlimited.sh` in your terminal to open the interactive manager:
