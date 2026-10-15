@@ -31,6 +31,7 @@ GoogleUnlimited/
 ├── RunWatcher.bat            # Interactive launcher (shows live terminal & animated progress)
 ├── StartPhotosWatcher.vbs    # Background launcher (runs silently with zero window)
 ├── StopWatcher.bat           # Stops any running background watcher instances
+├── ViewLogs.bat              # Displays recent sync activity logs with timestamps
 ├── CheckStatus.bat           # Status checker (shows upload count, recent uploads, retries)
 │
 ├── WatchAndUpload.ps1        # Core PowerShell orchestrator (engine, watcher, SQLite cache)
@@ -117,6 +118,19 @@ Double-click **`CheckStatus.bat`** anytime to view your sync health without inte
     [2026-10-15 20:10:36] pexels-ainc-t-76908403-37156188.jpg
     [2026-10-15 20:10:15] pexels-merve-aktas-yalman-2160736635-38224815.jpg
     [2026-10-15 20:07:34] pexels-roselene-de-koning-791440941-31630142.jpg
+==========================================================
+```
+
+### 4. View Activity Logs (`ViewLogs.bat`)
+Double-click **`ViewLogs.bat`** to view the last 30 timestamped activity events (successes, retries, scan results) recorded in SQLite:
+```text
+==========================================================
+  *  Google Photos Sync - Activity Logs (Last 30)
+  Database: C:\GoogleUnlimited\gphotos.db
+==========================================================
+[2026-10-15 20:10:36][OK] SUCCESS | photo.jpg (1.4 MB in 5.9s)
+[2026-10-15 20:17:18][INFO] Cache loaded: 133 uploaded files.
+[2026-10-15 20:35:01][OK] SUCCESS | Screenshot.png (10.4 KB in 4.9s)
 ==========================================================
 ```
 

@@ -4,7 +4,8 @@
 #  Zero hardcoded paths - Self-contained SQLite engine
 # =====================================================================
 param(
-    [switch]$StatusOnly
+    [switch]$StatusOnly,
+    [switch]$ShowLogs
 )
 $ErrorActionPreference = "Stop"
 
@@ -476,6 +477,34 @@ if ($StatusOnly) {
         foreach ($qf in $script:retryMap.Keys) {
             Write-Host "    $qf (attempt $($script:retryMap[$qf]))" -ForegroundColor DarkYellow
         }
+    }
+    Write-Host "==========================================================" -ForegroundColor Cyan
+    return
+}
+
+if ($ShowLogs) {
+    Write-Host ""
+    Write-Host "==========================================================" -ForegroundColor Cyan
+    Write-Host "  *  Google Photos Sync - Activity Logs (Last 30)"          -ForegroundColor Green
+    Write-Host "  Database: $script:DB"                                     -ForegroundColor Gray
+    Write-Host "==========================================================" -ForegroundColor Cyan
+
+    $logRows = Invoke-SqliteQuery -DataSource $script:DB `
+        -Query "SELECT timestamp, level, message FROM logs ORDER BY id DESC LIMIT 30"
+    if ($logRows) {
+        $logArray = @($logRows)
+        [Array]::Reverse($logArray)
+        foreach ($l in $logArray) {
+            $color = switch ($l.level) {
+                "ERROR" { "Red" }
+                "WARN"  { "DarkYellow" }
+                "OK"    { "Green" }
+                default { "Gray" }
+            }
+            Write-Host "[$($l.timestamp)][$($l.level)] $($l.message)" -ForegroundColor $color
+        }
+    } else {
+        Write-Host "  No activity logs found." -ForegroundColor DarkGray
     }
     Write-Host "==========================================================" -ForegroundColor Cyan
     return
