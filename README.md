@@ -30,6 +30,7 @@ GoogleUnlimited/
 │
 ├── RunWatcher.bat            # Interactive launcher (shows live terminal & animated progress)
 ├── StartPhotosWatcher.vbs    # Background launcher (runs silently with zero window)
+├── StopWatcher.bat           # Stops any running background watcher instances
 ├── CheckStatus.bat           # Status checker (shows upload count, recent uploads, retries)
 │
 ├── WatchAndUpload.ps1        # Core PowerShell orchestrator (engine, watcher, SQLite cache)
