@@ -67,7 +67,7 @@ init_db() {
         exit 1
     fi
 
-    sqlite3 "$DB" << 'EOF'
+    sqlite3 "$DB" >/dev/null << 'EOF'
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
@@ -257,7 +257,7 @@ do_status() {
     last_uploads=$(sqlite3 "$DB" "SELECT uploaded_at, path FROM uploads ORDER BY uploaded_at DESC LIMIT 10;" 2>/dev/null || true)
     if [ -n "$last_uploads" ]; then
         while IFS='|' read -r uploaded_at fpath; do
-            fname=$(basename "$fpath")
+            fname="${fpath##*[/\\]}"
             echo -e "    ${GRAY}[$uploaded_at]${NC} $fname"
         done <<< "$last_uploads"
     else
@@ -648,18 +648,26 @@ do_watch() {
     echo -e "${YELLOW}[Phase 2] Real-time watcher active.${NC}"
     echo "  Waiting for new media... Press Ctrl+C to stop."
 
-    cleanup() {
-        echo ""
-        echo "Stopping watcher..."
-        pkill -P $$ 2>/dev/null || true
-        kill 0 2>/dev/null || true
-        exit 0
-    }
-    trap cleanup SIGINT SIGTERM EXIT
-
+    # Run inotifywait pipeline in the background so parent can trap signals cleanly
     inotifywait -m -r -e close_write,moved_to,create --format '%w%f' "${watch_dirs[@]}" 2>/dev/null | while IFS= read -r new_path; do
         invoke_upload "$new_path"
-    done
+    done &
+    local watcher_pid=$!
+
+    cleanup() {
+        # Untrap immediately to prevent recursive signal/exit loops
+        trap - SIGINT SIGTERM EXIT
+        echo ""
+        echo "Stopping watcher..."
+        if [ -n "${watcher_pid:-}" ]; then
+            pkill -P "$watcher_pid" 2>/dev/null || true
+            kill "$watcher_pid" 2>/dev/null || true
+        fi
+        exit 0
+    }
+    trap cleanup SIGINT SIGTERM
+
+    wait "$watcher_pid" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------
