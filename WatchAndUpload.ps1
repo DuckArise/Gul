@@ -118,9 +118,40 @@ $script:fileLookup = New-Object 'System.Collections.Generic.HashSet[string]' ([S
 $script:retryMap   = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::OrdinalIgnoreCase)
 $script:inFlight   = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
-# Mutex for thread-safe DB access (keyed to database path)
-$mutexName = "GotohpDBMutex_" + [Math]::Abs($script:DB.ToLower().GetHashCode())
-$script:dbMutex = New-Object System.Threading.Mutex($false, $mutexName)
+# Mutex for thread-safe DB access (keyed to normalized database path)
+$cleanPath = $script:DB.ToLower().Replace("\", "_").Replace(":", "").Replace(" ", "_")
+$mutexName = "GotohpDBMutex_" + $cleanPath
+try {
+    $script:dbMutex = New-Object System.Threading.Mutex($false, $mutexName)
+} catch {
+    $script:dbMutex = New-Object System.Threading.Mutex($false, ("Local\" + $cleanPath))
+}
+
+# Safe argument formatting helper for Windows CommandLineToArgvW rules
+function Format-WindowsArgument([string]$arg) {
+    if ([string]::IsNullOrEmpty($arg)) { return '""' }
+    if ($arg -notmatch '[\s"\\<>&|^]') { return $arg }
+    $escaped = $arg -replace '(\\+)"', '$1$1\"' -replace '(\\+)$', '$1$1' -replace '"', '\"'
+    return "`"$escaped`""
+}
+
+# Safe fast SHA-256 computation helper
+function Get-FileHashSafe([string]$path) {
+    try {
+        if (-not [System.IO.File]::Exists($path)) { return "" }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $bytes = $sha.ComputeHash($stream)
+            return [System.BitConverter]::ToString($bytes).Replace("-", "").ToLower()
+        } finally {
+            $stream.Dispose()
+            $sha.Dispose()
+        }
+    } catch {
+        return ""
+    }
+}
 
 # Safe console writer (never throws IOException in headless/silent background mode)
 function Safe-ConsoleWrite([string]$text) {
@@ -216,6 +247,12 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
     try {
         Invoke-SqliteQuery -DataSource $script:DB -Query "CREATE INDEX IF NOT EXISTS idx_uploads_file ON uploads(file_name, file_size);" -ErrorAction SilentlyContinue | Out-Null
     } catch {}
+    try {
+        Invoke-SqliteQuery -DataSource $script:DB -Query "ALTER TABLE uploads ADD COLUMN content_hash TEXT;" -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
+    try {
+        Invoke-SqliteQuery -DataSource $script:DB -Query "CREATE INDEX IF NOT EXISTS idx_uploads_hash ON uploads(content_hash);" -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
 }
 
 # ---------------------------------------------------------------------
@@ -276,32 +313,49 @@ function Load-Cache {
         -Query "DELETE FROM logs WHERE timestamp < datetime('now', '-$($script:LOG_RETENTION_DAYS) days')" | Out-Null
 }
 
-function Save-Upload([string]$path, [string]$mediaKey, [string]$fileName = "", [long]$fileSize = 0) {
+function Save-Upload([string]$path, [string]$mediaKey, [string]$fileName = "", [long]$fileSize = 0, [string]$contentHash = "") {
     if (-not $fileName) { $fileName = [System.IO.Path]::GetFileName($path) }
     if ($fileSize -le 0 -and [System.IO.File]::Exists($path)) {
         try { $fileSize = (New-Object System.IO.FileInfo($path)).Length } catch {}
     }
+    if (-not $contentHash -and [System.IO.File]::Exists($path)) {
+        $contentHash = Get-FileHashSafe $path
+    }
 
     $hasMutex = $false
+    $saved = $false
     try {
         $hasMutex = $script:dbMutex.WaitOne(3000)
         if ($hasMutex) {
             Invoke-SqliteQuery -DataSource $script:DB `
-                -Query "INSERT OR REPLACE INTO uploads(path, media_key, file_name, file_size) VALUES(@p, @k, @fn, @fs)" `
-                -SqlParameters @{ p = $path; k = $mediaKey; fn = $fileName; fs = $fileSize } | Out-Null
+                -Query "INSERT OR REPLACE INTO uploads(path, media_key, file_name, file_size, content_hash) VALUES(@p, @k, @fn, @fs, @h)" `
+                -SqlParameters @{ p = $path; k = $mediaKey; fn = $fileName; fs = $fileSize; h = $contentHash } -ErrorAction Stop | Out-Null
             Invoke-SqliteQuery -DataSource $script:DB `
                 -Query "DELETE FROM retry_queue WHERE path = @p" `
-                -SqlParameters @{ p = $path } | Out-Null
+                -SqlParameters @{ p = $path } -ErrorAction SilentlyContinue | Out-Null
+            $saved = $true
+        } else {
+            Write-Log "Database mutex timeout (3000ms) saving upload for $fileName." "ERROR"
         }
+    } catch {
+        Write-Log "Failed to persist upload record for $fileName to database: $_" "ERROR"
+    } finally {
+        if ($hasMutex) {
+            try { $script:dbMutex.ReleaseMutex() } catch {}
+        }
+    }
+
+    if ($saved) {
         $script:history.Add($path) | Out-Null
         if ($fileName -and $fileSize -gt 0) {
             $script:fileLookup.Add("$fileName|$fileSize") | Out-Null
         }
         $null = $script:retryMap.Remove($path)
-    } finally {
-        if ($hasMutex) {
-            try { $script:dbMutex.ReleaseMutex() } catch {}
-        }
+        return $true
+    } else {
+        # Keep in retry map so it will be retried on next sweep
+        Save-Retry $path 0
+        return $false
     }
 }
 
@@ -312,7 +366,7 @@ function Save-Retry([string]$path, [int]$attempts) {
         if ($hasMutex) {
             Invoke-SqliteQuery -DataSource $script:DB `
                 -Query "INSERT OR REPLACE INTO retry_queue(path, attempts, last_attempt) VALUES(@p, @a, datetime('now','localtime'))" `
-                -SqlParameters @{ p = $path; a = $attempts } | Out-Null
+                -SqlParameters @{ p = $path; a = $attempts } -ErrorAction SilentlyContinue | Out-Null
         }
         $script:retryMap[$path] = $attempts
     } finally {
@@ -329,7 +383,7 @@ function Remove-Retry([string]$path) {
         if ($hasMutex) {
             Invoke-SqliteQuery -DataSource $script:DB `
                 -Query "DELETE FROM retry_queue WHERE path = @p" `
-                -SqlParameters @{ p = $path } | Out-Null
+                -SqlParameters @{ p = $path } -ErrorAction SilentlyContinue | Out-Null
         }
         $null = $script:retryMap.Remove($path)
     } finally {
@@ -352,19 +406,20 @@ function Wait-ForFileReady([string]$path) {
             if (-not [System.IO.File]::Exists($path)) { return "NOT_FOUND" }
             $info = New-Object System.IO.FileInfo($path)
 
-            if ($info.Length -lt $script:MIN_BYTES) {
+            # Reject empty 0-byte placeholders (wait for data to arrive)
+            if ($info.Length -le 0) {
                 Start-Sleep -Seconds 1
                 continue
             }
 
-            # If file size is actively growing, it's still being downloaded/written
+            # If file size is actively growing/changing, it's still being downloaded/written
             if ($info.Length -ne $lastSize) {
                 $lastSize = $info.Length
                 Start-Sleep -Seconds 2
                 continue
             }
 
-            # Test exclusive read access to verify writer has closed the file handle
+            # File size is stable and > 0. Test exclusive read access to verify writer has closed handle
             $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'None')
             $fs.Close()
             $fs.Dispose()
@@ -393,8 +448,31 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
     # Dual-boot cross-platform deduplication check (avoids duplicate uploads across OSes)
     $lookupKey = "$name|$($fileInfo.Length)"
     if ($script:fileLookup.Contains($lookupKey)) {
-        Save-Upload $path "DUAL_BOOT_SYNC" $name $fileInfo.Length
-        return
+        # File with identical name and size exists in database. Check hash to avoid false collisions.
+        $candidateHash = Get-FileHashSafe $path
+        $existing = Invoke-SqliteQuery -DataSource $script:DB `
+            -Query "SELECT content_hash FROM uploads WHERE file_name = @fn AND file_size = @fs AND file_size > 0 LIMIT 1" `
+            -SqlParameters @{ fn = $name; fs = $fileInfo.Length } -ErrorAction SilentlyContinue
+        
+        $isDuplicate = $false
+        if ($existing -and $existing.content_hash) {
+            if ($existing.content_hash -eq $candidateHash) {
+                $isDuplicate = $true
+            }
+        } elseif ($existing) {
+            # Legacy entry without hash: backfill hash and treat as duplicate
+            $isDuplicate = $true
+            if ($candidateHash) {
+                Invoke-SqliteQuery -DataSource $script:DB `
+                    -Query "UPDATE uploads SET content_hash = @h WHERE file_name = @fn AND file_size = @fs AND content_hash IS NULL" `
+                    -SqlParameters @{ h = $candidateHash; fn = $name; fs = $fileInfo.Length } -ErrorAction SilentlyContinue | Out-Null
+            }
+        }
+
+        if ($isDuplicate) {
+            Save-Upload $path "DUAL_BOOT_SYNC" $name $fileInfo.Length $candidateHash | Out-Null
+            return
+        }
     }
 
     if (-not $script:inFlight.Add($path)) { return }
@@ -433,8 +511,17 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
         if ($script:CONFIG_ARGS.Count -gt 0) {
             $uploadArgs += $script:CONFIG_ARGS
         }
-        $uploadArgs += @("upload", "`"$path`"")
-        $psi.Arguments = $uploadArgs -join " "
+        $uploadArgs += @("upload", $path)
+
+        # Support ArgumentList (.NET Core / PS 7) or robustly escaped argument string (PS 5.1)
+        if ($psi.PSObject.Properties['ArgumentList']) {
+            foreach ($arg in $uploadArgs) {
+                [void]$psi.ArgumentList.Add($arg)
+            }
+        } else {
+            $psi.Arguments = ($uploadArgs | ForEach-Object { Format-WindowsArgument $_ }) -join " "
+        }
+
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
         $psi.RedirectStandardOutput = $true
@@ -445,11 +532,25 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
         $barWidth = 20
         $step = 0
 
-        while (-not $proc.HasExited) {
-            Start-Sleep -Milliseconds 150
-            $elapsedSec = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
-            $step = ($step + 1) % $barWidth
+        # Asynchronously read standard output and standard error to avoid pipe deadlocks (BUG-02)
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
 
+        # Dynamic timeout: Minimum 600s (10 min), plus 1s per 50KB for large files
+        $timeoutSeconds = [Math]::Max(600, [int]($fileInfo.Length / 50KB))
+        $timedOut = $false
+
+        while (-not $proc.WaitForExit(150)) {
+            $elapsedSec = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
+            if ($elapsedSec -ge $timeoutSeconds) {
+                $timedOut = $true
+                try {
+                    $proc.Kill()
+                } catch {}
+                break
+            }
+
+            $step = ($step + 1) % $barWidth
             $barChars = [char[]]("-" * $barWidth)
             for ($k = 0; $k -lt 4; $k++) {
                 $barChars[($step + $k) % $barWidth] = [char]"#"
@@ -458,9 +559,14 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
             Safe-ConsoleWrite("`r  [$activeBar] Uploading $sizeLabel ($($elapsedSec)s)...   ")
         }
 
-        $stdout = $proc.StandardOutput.ReadToEnd()
-        $proc.WaitForExit()
-        $exitCode = $proc.ExitCode
+        $stdout = ""
+        $stderr = ""
+        try {
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+        } catch {}
+
+        $exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }
         $totalTime = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
         $doneBar = "#" * $barWidth
 
@@ -469,11 +575,21 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
             if ($stdout -match '"mediaKey":\s*"([^"]+)"') {
                 $mediaKey = $matches[1]
             }
+            $contentHash = Get-FileHashSafe $path
             Safe-ConsoleWrite("`r  [$doneBar] 100% [OK] Uploaded in $($totalTime)s: $name ($sizeLabel)        `n")
             Write-Log "SUCCESS | $name ($sizeLabel in $($totalTime)s)" "OK"
-            Save-Upload $path $mediaKey $name $fileInfo.Length
+            Save-Upload $path $mediaKey $name $fileInfo.Length $contentHash | Out-Null
         } else {
-            Safe-ConsoleWrite("`r  [--------------------] FAILED in $($totalTime)s: $name                      `n")
+            if ($timedOut) {
+                Safe-ConsoleWrite("`r  [--------------------] TIMED OUT after $($totalTime)s: $name                  `n")
+                Write-Log "TIMEOUT | Upload exceeded ${timeoutSeconds}s threshold: $name" "ERROR"
+            } else {
+                Safe-ConsoleWrite("`r  [--------------------] FAILED in $($totalTime)s: $name                      `n")
+                if ($stderr -and -not $stdout) {
+                    Write-Log "CLI stderr for ${name}: $stderr" "WARN"
+                }
+            }
+
             $attempts = 1
             if ($script:retryMap.ContainsKey($path)) {
                 $attempts = $script:retryMap[$path] + 1

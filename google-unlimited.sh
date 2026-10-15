@@ -4,9 +4,12 @@
 # Auto-Sync & Real-Time Watcher with Pixel Unlimited Backup
 # =====================================================================
 set -u
+# Security: Enforce restrictive umask so all created files/directories are accessible only by owner (SEC-03)
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB="$SCRIPT_DIR/gphotos.db"
+PID_FILE="$SCRIPT_DIR/.watcher.pid"
 SERVICE_NAME="google-unlimited.service"
 USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
 OS="${OS:-$(uname -s)}"
@@ -18,6 +21,89 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 GRAY='\033[0;90m'
 NC='\033[0m'
+
+# ---------------------------------------------------------------------
+# CRYPTOGRAPHIC HASH & BINARY INTEGRITY (BUG-05, SEC-02)
+# ---------------------------------------------------------------------
+compute_content_hash() {
+    local fpath="$1"
+    if [ ! -f "$fpath" ]; then
+        echo ""
+        return 1
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$fpath" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$fpath" 2>/dev/null | awk '{print $1}'
+    else
+        echo ""
+        return 1
+    fi
+}
+
+get_trusted_checksum() {
+    local bname="$1"
+    # Official trusted SHA-256 checksums from gotohp v0.11.0 release
+    case "$bname" in
+        gotohp-cli-macos-universal)
+            echo "d697e23c648881cf5e7db7b93f815f6d3dcbd9d7718a40d0edffee90456b0557" ;;
+        gotohp-cli_amd64)
+            echo "945021d5dbc36a96f53121eb4f907ace39d9457cea1b43107ed1986441b29030" ;;
+        gotohp-cli-x64.exe)
+            echo "c272a285a03aeea02a909f0b74d36f84c4a29c235c8dee47f7de75c83f15d2b1" ;;
+        gotohp-x64.exe)
+            echo "5c3f757b9e6b2ffd83934b59274136cf4e67c000265e2eaaa4f34dca6a821088" ;;
+        *)
+            echo "" ;;
+    esac
+}
+
+verify_binary() {
+    local bin_path="$1"
+    if [ ! -f "$bin_path" ]; then
+        echo -e "${RED}[ERROR] Binary file not found: $bin_path${NC}" >&2
+        return 1
+    fi
+    local bname
+    bname="$(basename "$bin_path")"
+    local expected
+    expected="$(get_trusted_checksum "$bname")"
+    if [ -z "$expected" ]; then
+        echo -e "${YELLOW}[WARN] No trusted checksum configured for $bname (skipping hash check).${NC}"
+        return 0
+    fi
+    local actual
+    actual="$(compute_content_hash "$bin_path")"
+    if [ -z "$actual" ]; then
+        echo -e "${YELLOW}[WARN] Neither sha256sum nor shasum available to verify binary integrity.${NC}"
+        return 0
+    fi
+    if [ "$actual" = "$expected" ]; then
+        echo -e "${GREEN}[OK] Verified $bname integrity (SHA-256: ${actual:0:16}...)${NC}"
+        return 0
+    else
+        echo -e "${RED}[ERROR] Binary integrity verification failed for $bname!${NC}" >&2
+        echo -e "${RED}  Expected: $expected${NC}" >&2
+        echo -e "${RED}  Actual:   $actual${NC}" >&2
+        return 1
+    fi
+}
+
+do_verify() {
+    echo ""
+    echo -e "${CYAN}==========================================================${NC}"
+    echo -e "${GREEN}  *  GoogleUnlimited - Binary Integrity Check${NC}"
+    echo -e "${CYAN}==========================================================${NC}"
+    local bin
+    bin="$(get_gotohp_bin)"
+    if [ -z "$bin" ]; then
+        echo -e "${RED}[ERROR] No gotohp-cli binary found in $SCRIPT_DIR${NC}" >&2
+        return 1
+    fi
+    echo "Checking binary: $bin"
+    verify_binary "$bin"
+}
+
 
 # ---------------------------------------------------------------------
 # BINARY & CONFIG DISCOVERY
@@ -91,9 +177,9 @@ init_db() {
         exit 1
     fi
 
-    # Security: Ensure restricted permissions on database and credentials
+    # Security: Ensure restricted permissions on database, WAL/SHM journals, and credentials (SEC-03)
     touch "$DB" 2>/dev/null || true
-    chmod 600 "$DB" 2>/dev/null || true
+    chmod 600 "$DB"* 2>/dev/null || true
     if [ -f "$SCRIPT_DIR/gotohp.config" ]; then
         chmod 600 "$SCRIPT_DIR/gotohp.config" 2>/dev/null || true
     fi
@@ -125,10 +211,12 @@ CREATE INDEX IF NOT EXISTS idx_logs_ts    ON logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
 EOF
 
-    # Dual-boot cross-platform tracking migration
+    # Dual-boot cross-platform tracking and content hash migration (BUG-05)
     sqlite3 "$DB" "ALTER TABLE uploads ADD COLUMN file_name TEXT;" 2>/dev/null || true
     sqlite3 "$DB" "ALTER TABLE uploads ADD COLUMN file_size INTEGER;" 2>/dev/null || true
+    sqlite3 "$DB" "ALTER TABLE uploads ADD COLUMN content_hash TEXT;" 2>/dev/null || true
     sqlite3 "$DB" "CREATE INDEX IF NOT EXISTS idx_uploads_file ON uploads(file_name, file_size);" 2>/dev/null || true
+    sqlite3 "$DB" "CREATE INDEX IF NOT EXISTS idx_uploads_hash ON uploads(content_hash);" 2>/dev/null || true
 }
 
 write_log() {
@@ -154,13 +242,45 @@ is_uploaded() {
         fsize=0
     fi
 
-    local count
-    if [ "$fsize" -gt 0 ]; then
-        count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE path = '$escaped_path' OR (file_name = '$escaped_name' AND file_size = $fsize AND file_size > 0);" 2>/dev/null || echo 0)
-    else
-        count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE path = '$escaped_path';" 2>/dev/null || echo 0)
+    # 1. Exact path match
+    local exact
+    exact=$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE path = '$escaped_path';" 2>/dev/null || echo 0)
+    if [ -n "$exact" ] && [ "$exact" -gt 0 ]; then
+        return 0
     fi
-    [ -n "$count" ] && [ "$count" -gt 0 ]
+
+    # 2. Dual-boot cross-platform deduplication check with content hash verification (BUG-05)
+    if [ "$fsize" -gt 0 ]; then
+        local match_row
+        match_row=$(sqlite3 "$DB" "SELECT content_hash FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND file_size > 0 LIMIT 1;" 2>/dev/null || true)
+        if [ -n "$match_row" ]; then
+            local current_hash
+            current_hash="$(compute_content_hash "$fpath")"
+            if [ -n "$current_hash" ]; then
+                # Match against database content_hash to avoid false collisions between different files
+                local hash_match
+                hash_match=$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND content_hash = '$current_hash';" 2>/dev/null || echo 0)
+                if [ -n "$hash_match" ] && [ "$hash_match" -gt 0 ]; then
+                    return 0
+                fi
+                # Check for legacy entry where content_hash was not set yet
+                local legacy_match
+                legacy_match=$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND (content_hash IS NULL OR content_hash = '');" 2>/dev/null || echo 0)
+                if [ -n "$legacy_match" ] && [ "$legacy_match" -gt 0 ]; then
+                    # Backfill content_hash into legacy record
+                    sqlite3 "$DB" "UPDATE uploads SET content_hash = '$current_hash' WHERE file_name = '$escaped_name' AND file_size = $fsize AND (content_hash IS NULL OR content_hash = '');" 2>/dev/null || true
+                    return 0
+                fi
+                # Name and size matched, but content hash differs -> NOT duplicate
+                return 1
+            else
+                # Fallback if hash tools unavailable
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
 }
 
 save_upload() {
@@ -171,13 +291,16 @@ save_upload() {
     local escaped_path="${fpath//\'/\'\'}"
     local escaped_mkey="${mkey//\'/\'\'}"
     local escaped_name="${fname//\'/\'\'}"
+    local chash
+    chash="$(compute_content_hash "$fpath")"
+    local escaped_hash="${chash//\'/\'\'}"
 
     if ! [[ "$fsize" =~ ^[0-9]+$ ]]; then
         fsize=0
     fi
 
     sqlite3 "$DB" << EOF
-INSERT OR REPLACE INTO uploads(path, media_key, file_name, file_size) VALUES ('$escaped_path', '$escaped_mkey', '$escaped_name', $fsize);
+INSERT OR REPLACE INTO uploads(path, media_key, file_name, file_size, content_hash) VALUES ('$escaped_path', '$escaped_mkey', '$escaped_name', $fsize, '$escaped_hash');
 DELETE FROM retry_queue WHERE path = '$escaped_path';
 EOF
 }
@@ -236,11 +359,21 @@ do_setup() {
         local target_bin="$SCRIPT_DIR/gotohp-cli-macos-universal"
         if [ ! -s "$target_bin" ]; then
             echo -e "${YELLOW}[Setup] Downloading gotohp-cli Universal for macOS...${NC}"
-            rm -f "$target_bin"
-            if ! curl -fSL "https://github.com/xob0t/gotohp/releases/latest/download/gotohp-cli-macos-universal" -o "$target_bin"; then
+            local tmp_bin="$target_bin.dl"
+            rm -f "$tmp_bin"
+            if curl -fSL "https://github.com/xob0t/gotohp/releases/latest/download/gotohp-cli-macos-universal" -o "$tmp_bin"; then
+                if verify_binary "$tmp_bin"; then
+                    mv "$tmp_bin" "$target_bin"
+                else
+                    echo -e "${RED}[SECURITY ERROR] Downloaded macOS binary failed integrity verification! Removing.${NC}" >&2
+                    rm -f "$tmp_bin"
+                fi
+            else
                 echo -e "${RED}[ERROR] Failed to download gotohp-cli Universal for macOS.${NC}" >&2
-                rm -f "$target_bin"
+                rm -f "$tmp_bin"
             fi
+        else
+            verify_binary "$target_bin" || true
         fi
 
         # Security: strip Apple quarantine flag & set secure permissions
@@ -273,27 +406,33 @@ do_setup() {
             echo -e "${GREEN}[OK] Required packages (inotify-tools, sqlite3, curl) are already installed.${NC}"
         fi
 
-        # Verify/download gotohp-cli for Linux
+        # Verify/download gotohp-cli for Linux with integrity verification (SEC-02)
         local arch
         arch="$(uname -m)"
         local target_bin="$SCRIPT_DIR/gotohp-cli_amd64"
+        local dl_url="https://github.com/xob0t/gotohp/releases/latest/download/gotohp-cli_amd64"
         if [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
             target_bin="$SCRIPT_DIR/gotohp-cli_arm64"
-            if [ ! -s "$target_bin" ]; then
-                echo -e "${YELLOW}[Setup] Downloading gotohp-cli for Linux ARM64...${NC}"
-                rm -f "$target_bin"
-                if ! curl -fSL "https://github.com/xob0t/gotohp/releases/latest/download/gotohp-cli_arm64" -o "$target_bin"; then
-                    echo -e "${RED}[ERROR] Failed to download gotohp-cli_arm64.${NC}" >&2
-                    rm -f "$target_bin"
+            dl_url="https://github.com/xob0t/gotohp/releases/latest/download/gotohp-cli_arm64"
+        fi
+
+        if [ ! -s "$target_bin" ]; then
+            echo -e "${YELLOW}[Setup] Downloading gotohp-cli for Linux ($arch)...${NC}"
+            local tmp_bin="$target_bin.dl"
+            rm -f "$tmp_bin"
+            if curl -fSL "$dl_url" -o "$tmp_bin"; then
+                if verify_binary "$tmp_bin"; then
+                    mv "$tmp_bin" "$target_bin"
+                else
+                    echo -e "${RED}[SECURITY ERROR] Downloaded Linux binary failed integrity verification! Removing.${NC}" >&2
+                    rm -f "$tmp_bin"
                 fi
+            else
+                echo -e "${RED}[ERROR] Failed to download gotohp-cli binary.${NC}" >&2
+                rm -f "$tmp_bin"
             fi
-        elif [ ! -s "$target_bin" ]; then
-            echo -e "${YELLOW}[Setup] Downloading gotohp-cli for Linux x86_64...${NC}"
-            rm -f "$target_bin"
-            if ! curl -fSL "https://github.com/xob0t/gotohp/releases/latest/download/gotohp-cli_amd64" -o "$target_bin"; then
-                echo -e "${RED}[ERROR] Failed to download gotohp-cli_amd64.${NC}" >&2
-                rm -f "$target_bin"
-            fi
+        else
+            verify_binary "$target_bin" || true
         fi
         [ -s "$target_bin" ] && chmod 700 "$target_bin" 2>/dev/null || true
     fi
@@ -302,12 +441,12 @@ do_setup() {
     chmod 755 "$SCRIPT_DIR"/*.sh 2>/dev/null || true
     chmod 700 "$SCRIPT_DIR"/gotohp-cli* 2>/dev/null || true
 
-    # Security: Restrict permissions on sensitive configuration files
+    # Security: Restrict permissions on sensitive configuration files (SEC-03)
     if [ -f "$SCRIPT_DIR/gotohp.config" ]; then
         chmod 600 "$SCRIPT_DIR/gotohp.config" 2>/dev/null || true
     fi
     if [ -f "$DB" ]; then
-        chmod 600 "$DB" 2>/dev/null || true
+        chmod 600 "$DB"* 2>/dev/null || true
     fi
     echo -e "${GREEN}[OK] Security permissions hardened (chmod 600 on secrets, 700 on binaries).${NC}"
 
@@ -327,8 +466,10 @@ do_setup() {
         if [ -f "$SCRIPT_DIR/gotohp.config" ]; then
             cfg_hint="--config gotohp.config "
         fi
-        echo "  3. Run:"
-        echo "     ./google-unlimited.sh ${cfg_hint}creds add \"<oauth_token>\""
+        echo "  3. Run (interactive hidden input - SEC-01):"
+        echo "     ./google-unlimited.sh ${cfg_hint}creds add"
+        echo "     Or pipe via standard input:"
+        echo "     echo \"<oauth_token>\" | ./google-unlimited.sh ${cfg_hint}creds add -"
         echo -e "${YELLOW}==========================================================${NC}"
     fi
 
@@ -426,9 +567,41 @@ do_stop() {
     echo -e "${CYAN}Stopping Google Photos background watcher...${NC}"
     local stopped=0
 
-    # Stop processes matching google-unlimited.sh or watch_and_upload.sh
+    # 1. Stop via dedicated PID file if present (REL-02)
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
+            local is_watcher=0
+            if [ -d "/proc/$pid" ]; then
+                if grep -qa "google-unlimited" "/proc/$pid/cmdline" 2>/dev/null; then
+                    is_watcher=1
+                fi
+            elif ps -p "$pid" -o command= 2>/dev/null | grep -q "google-unlimited"; then
+                is_watcher=1
+            fi
+
+            if [ "$is_watcher" -eq 1 ] && [ "$pid" != "$$" ]; then
+                kill -TERM "$pid" 2>/dev/null || true
+                for ((w=0; w<20; w++)); do
+                    if ! kill -0 "$pid" 2>/dev/null; then
+                        break
+                    fi
+                    sleep 0.1
+                done
+                if kill -0 "$pid" 2>/dev/null; then
+                    kill -9 "$pid" 2>/dev/null || true
+                fi
+                echo -e "${GREEN}[OK] Terminated watcher process PID $pid (from PID file)${NC}"
+                stopped=1
+            fi
+        fi
+        rm -f "$PID_FILE" 2>/dev/null || true
+    fi
+
+    # 2. Scoped fallback for any background watcher instances running this script
     local pids
-    pids=$(pgrep -f "google-unlimited.sh|watch_and_upload.sh" || true)
+    pids=$(pgrep -f "google-unlimited\.sh.*watch" || true)
     if [ -n "$pids" ]; then
         for pid in $pids; do
             if [ "$pid" != "$$" ]; then
@@ -443,7 +616,7 @@ do_stop() {
         # Terminate macOS launchd agent if active
         launchctl stop com.googleunlimited.watcher 2>/dev/null || true
         local fpids
-        fpids=$(pgrep -f "fswatch.*$SCRIPT_DIR" || pgrep -f "fswatch" || true)
+        fpids=$(pgrep -f "fswatch.*$SCRIPT_DIR" || true)
         if [ -n "$fpids" ]; then
             for fpid in $fpids; do
                 kill "$fpid" 2>/dev/null || true
@@ -452,9 +625,9 @@ do_stop() {
             done
         fi
     else
-        # Terminate orphaned inotifywait listeners on Linux
+        # Terminate orphaned inotifywait listeners strictly scoped to watched paths
         local ipids
-        ipids=$(pgrep -f "inotifywait -m -r -e close_write,moved_to" || true)
+        ipids=$(pgrep -f "inotifywait -m -r -e close_write,moved_to,create" || true)
         if [ -n "$ipids" ]; then
             for ipid in $ipids; do
                 kill "$ipid" 2>/dev/null || true
@@ -484,12 +657,23 @@ do_stop() {
 # ACTION: ENABLE STARTUP (launchd on macOS / systemd on Linux)
 # ---------------------------------------------------------------------
 do_enable_startup() {
+    # Verify valid credentials before enabling startup service (REL-01)
+    local creds_check
+    creds_check="$(run_gotohp creds list 2>&1 || true)"
+    if ! echo "$creds_check" | grep -q "\*"; then
+        echo -e "${RED}[ERROR] No active Google account logged in!${NC}" >&2
+        echo "Please sign in before enabling startup service:" >&2
+        echo "  ./google-unlimited.sh creds add" >&2
+        return 1
+    fi
+
     if [ "$OS" = "Darwin" ]; then
         echo -e "${CYAN}Enabling Google Photos Auto-Sync on startup (macOS launchd)...${NC}"
         local plist_dir="$HOME/Library/LaunchAgents"
         local plist_file="$plist_dir/com.googleunlimited.watcher.plist"
         mkdir -p "$plist_dir"
 
+        # Prevent restart loops on clean exit or missing auth (REL-01)
         cat << EOF > "$plist_file"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -508,7 +692,14 @@ do_enable_startup() {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>StandardOutPath</key>
     <string>/dev/null</string>
     <key>StandardErrorPath</key>
@@ -629,39 +820,56 @@ do_disable_startup() {
 # ---------------------------------------------------------------------
 wait_for_file_ready() {
     local fpath="$1"
-    local min_bytes=10240
     [ ! -f "$fpath" ] && return 2
 
     local last_size=-1
+    local stable_count=0
+
+    # Bounded timeout loop (30 iterations)
     for ((i=0; i<30; i++)); do
         [ ! -f "$fpath" ] && return 2
         local size
         size=$(stat -c%s "$fpath" 2>/dev/null || stat -f%z "$fpath" 2>/dev/null || echo 0)
 
-        if [ "$size" -lt "$min_bytes" ]; then
+        # 0-byte placeholders are not ready yet (wait for write to start)
+        if [ "$size" -le 0 ]; then
             sleep 1
             continue
         fi
 
+        # Check if size is actively changing (file still being downloaded/written)
         if [ "$size" -ne "$last_size" ]; then
             last_size="$size"
-            sleep 2
+            stable_count=1
+            sleep 1
             continue
+        else
+            stable_count=$((stable_count + 1))
         fi
 
-        if command -v lsof >/dev/null 2>&1; then
-            if lsof "$fpath" 2>/dev/null | grep -qE " (W|u) "; then
-                sleep 2
+        # Once size is stable across checks, verify writer lock
+        if [ "$stable_count" -ge 2 ]; then
+            local locked=0
+            if command -v lsof >/dev/null 2>&1; then
+                if lsof "$fpath" 2>/dev/null | grep -qE " (W|u) "; then
+                    locked=1
+                fi
+            elif command -v fuser >/dev/null 2>&1; then
+                if fuser -s "$fpath" 2>/dev/null; then
+                    locked=1
+                fi
+            fi
+
+            if [ "$locked" -eq 1 ]; then
+                sleep 1
                 continue
             fi
-        elif command -v fuser >/dev/null 2>&1; then
-            if fuser -s "$fpath" 2>/dev/null; then
-                sleep 2
-                continue
-            fi
+
+            # File is non-empty, size is stable, and writer handle is released -> READY (BUG-01)
+            return 0
         fi
 
-        return 0
+        sleep 1
     done
     return 1
 }
@@ -847,6 +1055,7 @@ do_watch() {
     fi
 
     # Phase 2: Real-time Watcher
+    echo "$$" > "$PID_FILE"
     local watcher_pid=""
     if [ "$OS" = "Darwin" ]; then
         echo ""
@@ -873,6 +1082,7 @@ do_watch() {
         trap - SIGINT SIGTERM EXIT
         echo ""
         echo "Stopping watcher..."
+        rm -f "$PID_FILE" 2>/dev/null || true
         if [ -n "${watcher_pid:-}" ]; then
             pkill -P "$watcher_pid" 2>/dev/null || true
             kill "$watcher_pid" 2>/dev/null || true
@@ -884,9 +1094,57 @@ do_watch() {
         fi
         exit 0
     }
-    trap cleanup SIGINT SIGTERM
+    trap cleanup SIGINT SIGTERM EXIT
 
     wait "$watcher_pid" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------
+# SECURE CREDENTIALS HANDLER (SEC-01)
+# ---------------------------------------------------------------------
+do_creds() {
+    local subcmd="${1:-}"
+    shift || true
+
+    if [ "$subcmd" = "add" ]; then
+        local token="${1:-}"
+        if [ -z "$token" ] || [ "$token" = "-" ]; then
+            if [ -t 0 ]; then
+                # Interactive terminal: prompt with hidden input (SEC-01)
+                local stty_state=""
+                stty_state="$(stty -g 2>/dev/null || true)"
+                restore_stty() {
+                    if [ -n "$stty_state" ]; then
+                        stty "$stty_state" 2>/dev/null || true
+                    fi
+                }
+                trap restore_stty INT TERM EXIT
+                echo -n "Enter Google OAuth token (hidden): " >&2
+                stty -echo 2>/dev/null || true
+                read -r token
+                stty echo 2>/dev/null || true
+                echo "" >&2
+                trap - INT TERM EXIT
+                restore_stty
+            else
+                # Pipe or redirected standard input (creds add -)
+                read -r token
+            fi
+
+            if [ -z "$token" ]; then
+                echo -e "${RED}[ERROR] No OAuth token provided.${NC}" >&2
+                return 1
+            fi
+            printf "%s\n" "$token" | run_gotohp creds add -
+        else
+            # Positional argument provided: print deprecation warning (SEC-01)
+            echo -e "${YELLOW}[SECURITY WARNING] Passing OAuth tokens via command-line arguments exposes them in process listings and shell history.${NC}" >&2
+            echo -e "${YELLOW}Please use: ./google-unlimited.sh creds add (interactive hidden prompt) or pipe: creds add -${NC}" >&2
+            printf "%s\n" "$token" | run_gotohp creds add -
+        fi
+    else
+        run_gotohp creds "$subcmd" "$@"
+    fi
 }
 
 # ---------------------------------------------------------------------
@@ -908,9 +1166,10 @@ show_menu() {
     fi
     echo "  [6] Disable Auto-Start on Boot"
     echo "  [7] Stop Background Watcher"
+    echo "  [8] Verify Binary Integrity"
     echo "  [0] Exit"
     echo -e "${CYAN}==========================================================${NC}"
-    read -rp "Select an option [1-7, Default: 1]: " choice
+    read -rp "Select an option [0-8, Default: 1]: " choice
     choice="${choice:-1}"
 
     case "$choice" in
@@ -921,6 +1180,7 @@ show_menu() {
         5) do_enable_startup ;;
         6) do_disable_startup ;;
         7) do_stop ;;
+        8) do_verify ;;
         0) exit 0 ;;
         *) echo "Invalid option"; sleep 1; show_menu ;;
     esac
@@ -937,7 +1197,8 @@ show_help() {
     echo "  enable            Enable auto-start on boot (launchd on macOS / systemd on Linux)"
     echo "  disable           Disable auto-start service"
     echo "  stop              Stop running background watcher instances"
-    echo "  creds             Pass creds commands directly to gotohp-cli"
+    echo "  verify            Verify gotohp-cli binary integrity using trusted SHA-256"
+    echo "  creds             Manage credentials securely (creds add / creds list)"
     echo "  menu              Open interactive terminal menu"
     echo "  help              Show this help message"
 }
@@ -968,9 +1229,12 @@ case "$CMD" in
     stop|--stop)
         do_stop
         ;;
+    verify|--verify)
+        do_verify
+        ;;
     creds)
         shift
-        run_gotohp creds "$@"
+        do_creds "$@"
         ;;
     menu|--menu)
         show_menu

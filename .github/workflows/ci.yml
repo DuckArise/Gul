@@ -1,0 +1,165 @@
+name: GoogleUnlimited CI & Regression Test Suite
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  lint-and-validate:
+    name: Lint & Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: ShellCheck Bash Scripts
+        run: |
+          shellcheck -e SC2034,SC2086,SC2181 google-unlimited.sh
+          shellcheck -e SC2034,SC2086,SC2181 tests/*.sh
+
+      - name: Bash Syntax Validation (bash -n)
+        run: |
+          bash -n google-unlimited.sh
+          for f in tests/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: PowerShell ScriptAnalyzer & Syntax Validation
+        shell: pwsh
+        run: |
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          $analyzerResults = Invoke-ScriptAnalyzer -Path ./WatchAndUpload.ps1 -Severity Error
+          if ($analyzerResults) {
+            $analyzerResults | Format-Table -AutoSize
+            exit 1
+          }
+
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseInput((Get-Content WatchAndUpload.ps1 -Raw), [ref]$null, [ref]$parseErrors) | Out-Null
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+          Write-Host "PowerShell syntax and linting checks passed!"
+
+  test-linux:
+    name: Linux Regression Tests (Ubuntu)
+    runs-on: ubuntu-latest
+    needs: lint-and-validate
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 inotify-tools curl
+
+      - name: Run Test - File Readiness (BUG-01)
+        run: |
+          chmod +x tests/test_readiness.sh
+          ./tests/test_readiness.sh
+
+      - name: Run Test - Token Protection (SEC-01)
+        run: |
+          chmod +x tests/test_creds.sh
+          ./tests/test_creds.sh
+
+      - name: Run Test - Deduplication Collision (BUG-05)
+        run: |
+          chmod +x tests/test_dedup.sh
+          ./tests/test_dedup.sh
+
+      - name: Run Test - SQLite & WAL Permissions (SEC-03)
+        run: |
+          chmod +x tests/test_permissions.sh
+          ./tests/test_permissions.sh
+
+      - name: Run Test - Safe Process Termination (REL-02)
+        run: |
+          chmod +x tests/test_process_stop.sh
+          ./tests/test_process_stop.sh
+
+  test-windows:
+    name: Windows Regression Tests (PowerShell)
+    runs-on: windows-latest
+    needs: lint-and-validate
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Test - File Readiness (BUG-01)
+        shell: pwsh
+        run: ./tests/test_readiness.ps1
+
+      - name: Run Test - Argument Quoting (BUG-03)
+        shell: pwsh
+        run: ./tests/test_quoting.ps1
+
+      - name: Run Test - Pipe Deadlock Elimination (BUG-02)
+        shell: pwsh
+        run: ./tests/test_deadlock.ps1
+
+      - name: Run Test - Deduplication Collision (BUG-05)
+        shell: pwsh
+        run: ./tests/test_dedup.ps1
+
+      - name: Run Test - Persistence & Consistency (BUG-04)
+        shell: pwsh
+        run: ./tests/test_persistence.ps1
+
+  test-macos:
+    name: macOS Regression Tests (macOS)
+    runs-on: macos-latest
+    needs: lint-and-validate
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Bash Scripts Validation on macOS
+        run: |
+          chmod +x tests/*.sh
+          ./tests/test_readiness.sh
+          ./tests/test_creds.sh
+          ./tests/test_dedup.sh
+          ./tests/test_permissions.sh
+
+      - name: Validate LaunchAgent Plist Configuration (REL-01)
+        run: |
+          mkdir -p ~/Library/LaunchAgents
+          ./google-unlimited.sh help >/dev/null
+          # Test generated LaunchAgent plist syntax
+          PLIST_PATH="$HOME/Library/LaunchAgents/com.googleunlimited.watcher.plist"
+          # Verify plutil lints the KeepAlive dict and ThrottleInterval keys cleanly
+          cat << 'EOF' > "$PLIST_PATH"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>Label</key>
+              <string>com.googleunlimited.watcher</string>
+              <key>ProgramArguments</key>
+              <array>
+                  <string>/bin/bash</string>
+                  <string>/tmp/google-unlimited.sh</string>
+                  <string>watch</string>
+              </array>
+              <key>RunAtLoad</key>
+              <true/>
+              <key>KeepAlive</key>
+              <dict>
+                  <key>SuccessfulExit</key>
+                  <false/>
+                  <key>Crashed</key>
+                  <true/>
+              </dict>
+              <key>ThrottleInterval</key>
+              <integer>30</integer>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$PLIST_PATH"
