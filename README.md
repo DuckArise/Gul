@@ -50,12 +50,26 @@ git clone https://github.com/shishir0x/GoogleUnlimited.git
 ```
 
 ### 2. Sign In to Google Photos (One-Time)
-1. Double-click **`gotohp-x64.exe`**.
-2. Click **Add Account** / **Sign In**.
-3. A Google sign-in window will open in your browser — log in with your Google account.
-4. Once signed in, you can close the GUI window. Your authentication is securely saved locally.
 
-*(Optional CLI login: Run `gotohp-cli-x64.exe creds add` in terminal).*
+To spoof Google Pixel unlimited backup, `gotohp` authenticates via Google's Embedded Setup token:
+
+#### Option 1 — GUI Setup (Recommended)
+1. Double-click **`gotohp-x64.exe`** and click **Add Google account**.
+2. Click **Open Google sign-in** and sign in with the Google account you want to use.
+3. Sign in on the Google Embedded Setup page and click **I agree**.  
+   *(Note: The page may keep loading / buffering forever; this is completely normal and expected!)*
+4. Open your browser Developer Tools (press **F12** or right-click anywhere and choose **Inspect**):
+   - Go to the **Application** tab (Chrome / Edge / Brave) or **Storage** tab (Firefox).
+   - Under the **Cookies** section in the left panel, click **`https://accounts.google.com`**.
+   - Find the cookie named **`oauth_token`** and copy only its value.
+5. Return to **`gotohp`**, paste the token value into the input field, and click **Connect account**.
+6. Once connected, your auth is securely saved locally. You can now close the GUI window.
+
+#### Option 2 — CLI Setup
+From the command line, open the Embedded Setup sign-in page, retrieve the `oauth_token` using the steps above, and run:
+```cmd
+.\gotohp-cli-x64.exe creds add "<oauth_token value>"
+```
 
 ### 3. Start Syncing
 Choose how you want to run it:
