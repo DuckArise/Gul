@@ -3,6 +3,10 @@
 > **Zero-Quota, Unlimited Google Photos Auto-Sync for Windows**  
 > Native Windows background watcher that automatically uploads photos and videos with **Pixel original quality unlimited backup** — without WSL, WSA, Android emulators, or Morphe crashes.
 
+<p align="center">
+  <img src="reddit_showcase.jpg" alt="GoogleUnlimited Showcase" width="100%" />
+</p>
+
 ---
 
 ## Features
