@@ -30,6 +30,8 @@ GoogleUnlimited/
 │
 ├── RunWatcher.bat            # Interactive launcher (shows live terminal & animated progress)
 ├── StartPhotosWatcher.vbs    # Background launcher (runs silently with zero window)
+├── EnableStartup.bat         # 1-click installer: auto-starts watcher on Windows boot
+├── DisableStartup.bat        # 1-click uninstaller: removes watcher from Windows boot
 ├── StopWatcher.bat           # Stops any running background watcher instances
 ├── ViewLogs.bat              # Displays recent sync activity logs with timestamps
 ├── CheckStatus.bat           # Status checker (shows upload count, recent uploads, retries)
@@ -93,13 +95,19 @@ To have backups run silently with zero terminal window:
 - Double-click **`StartPhotosWatcher.vbs`**.
 
 #### Start Automatically When Windows Turns On (Recommended)
-To have it automatically start in the background every time you turn on your PC:
-1. Press `Win + R` on your keyboard, type **`shell:startup`**, and hit **Enter**. (This opens your Windows Startup folder).
-2. Right-click inside the folder → **New** → **Shortcut**.
-3. Browse and select **`StartPhotosWatcher.vbs`** (or drag `StartPhotosWatcher.vbs` into the Startup folder while holding `Alt`).
-4. Click **Next** and **Finish**.
+You have two simple ways to enable auto-start on boot:
 
-Now, whenever you log into Windows, it will automatically run in the background.
+- **Option A (1-Click Method)**:
+  Double-click **`EnableStartup.bat`**.  
+  *(To disable auto-start later, simply double-click **`DisableStartup.bat`**).*
+
+- **Option B (Manual Method)**:
+  1. Press `Win + R` on your keyboard, type **`shell:startup`**, and hit **Enter**.
+  2. Right-click inside the Startup folder → **New** → **Shortcut**.
+  3. Browse and select **`StartPhotosWatcher.vbs`** (or drag `StartPhotosWatcher.vbs` into the folder while holding `Alt`).
+  4. Click **Next** and **Finish**.
+
+Now, whenever you log into Windows, the sync watcher will run quietly in the background.
 
 #### Stop the Background Watcher (`StopWatcher.bat`)
 To stop the background sync at any time, simply double-click **`StopWatcher.bat`**.
