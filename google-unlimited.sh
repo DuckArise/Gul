@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# GoogleUnlimited - Native Linux Unified Manager
+# GoogleUnlimited - Native Linux & macOS Unified Manager
 # Auto-Sync & Real-Time Watcher with Pixel Unlimited Backup
 # =====================================================================
 set -u
@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB="$SCRIPT_DIR/gphotos.db"
 SERVICE_NAME="google-unlimited.service"
 USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
+OS="${OS:-$(uname -s)}"
 
 # Terminal Colors
 CYAN='\033[0;36m'
@@ -22,13 +23,30 @@ NC='\033[0m'
 # BINARY & CONFIG DISCOVERY
 # ---------------------------------------------------------------------
 get_gotohp_bin() {
-    for cand in "$SCRIPT_DIR/gotohp-cli" "$SCRIPT_DIR/gotohp-cli_amd64" "$SCRIPT_DIR/gotohp-cli_arm64"; do
-        if [ -x "$cand" ] || [ -f "$cand" ]; then
+    local cands=("$SCRIPT_DIR/gotohp-cli")
+    if [ "$OS" = "Darwin" ]; then
+        cands+=("$SCRIPT_DIR/gotohp-cli-macos-universal" "$SCRIPT_DIR/gotohp-cli-macos")
+    else
+        cands+=("$SCRIPT_DIR/gotohp-cli_amd64" "$SCRIPT_DIR/gotohp-cli_arm64")
+    fi
+
+    for cand in "${cands[@]}"; do
+        if [ -s "$cand" ]; then
             chmod +x "$cand" 2>/dev/null || true
             echo "$cand"
             return 0
         fi
     done
+
+    # Fallback to any other gotohp-cli binary in SCRIPT_DIR
+    for cand in "$SCRIPT_DIR"/gotohp-cli*; do
+        if [ -s "$cand" ] && [ "$cand" != "$SCRIPT_DIR/gotohp.config" ]; then
+            chmod +x "$cand" 2>/dev/null || true
+            echo "$cand"
+            return 0
+        fi
+    done
+
     if command -v gotohp-cli >/dev/null 2>&1; then
         command -v gotohp-cli
         return 0
@@ -56,6 +74,12 @@ run_gotohp() {
     cmd_spec="$(get_gotohp_cmd)"
     IFS='|' read -r -a cmd_arr <<< "$cmd_spec"
     "${cmd_arr[@]}" "$@"
+    local ret=$?
+    # Security: Ensure gotohp.config retains restrictive 600 permissions
+    if [ -f "$SCRIPT_DIR/gotohp.config" ]; then
+        chmod 600 "$SCRIPT_DIR/gotohp.config" 2>/dev/null || true
+    fi
+    return $ret
 }
 
 # ---------------------------------------------------------------------
@@ -65,6 +89,13 @@ init_db() {
     if ! command -v sqlite3 >/dev/null 2>&1; then
         echo -e "${RED}[ERROR] sqlite3 is not installed. Please run: ./google-unlimited.sh setup${NC}" >&2
         exit 1
+    fi
+
+    # Security: Ensure restricted permissions on database and credentials
+    touch "$DB" 2>/dev/null || true
+    chmod 600 "$DB" 2>/dev/null || true
+    if [ -f "$SCRIPT_DIR/gotohp.config" ]; then
+        chmod 600 "$SCRIPT_DIR/gotohp.config" 2>/dev/null || true
     fi
 
     sqlite3 "$DB" >/dev/null << 'EOF'
@@ -106,7 +137,8 @@ write_log() {
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
     local escaped_msg="${msg//\'/\'\'}"
-    sqlite3 "$DB" "INSERT INTO logs(level, message) VALUES ('$level', '$escaped_msg');" 2>/dev/null || true
+    local escaped_level="${level//\'/\'\'}"
+    sqlite3 "$DB" "INSERT INTO logs(level, message) VALUES ('$escaped_level', '$escaped_msg');" 2>/dev/null || true
     echo "[$ts][$level] $msg"
 }
 
@@ -116,6 +148,11 @@ is_uploaded() {
     local fsize="${3:-0}"
     local escaped_path="${fpath//\'/\'\'}"
     local escaped_name="${fname//\'/\'\'}"
+
+    # Ensure fsize is numeric to prevent SQL injection
+    if ! [[ "$fsize" =~ ^[0-9]+$ ]]; then
+        fsize=0
+    fi
 
     local count
     if [ "$fsize" -gt 0 ]; then
@@ -132,18 +169,26 @@ save_upload() {
     local fname="${3:-$(basename "$fpath")}"
     local fsize="${4:-0}"
     local escaped_path="${fpath//\'/\'\'}"
+    local escaped_mkey="${mkey//\'/\'\'}"
     local escaped_name="${fname//\'/\'\'}"
 
+    if ! [[ "$fsize" =~ ^[0-9]+$ ]]; then
+        fsize=0
+    fi
+
     sqlite3 "$DB" << EOF
-INSERT OR REPLACE INTO uploads(path, media_key, file_name, file_size) VALUES ('$escaped_path', '$mkey', '$escaped_name', $fsize);
+INSERT OR REPLACE INTO uploads(path, media_key, file_name, file_size) VALUES ('$escaped_path', '$escaped_mkey', '$escaped_name', $fsize);
 DELETE FROM retry_queue WHERE path = '$escaped_path';
 EOF
 }
 
 save_retry() {
     local fpath="$1"
-    local attempts="$2"
+    local attempts="${2:-0}"
     local escaped_path="${fpath//\'/\'\'}"
+    if ! [[ "$attempts" =~ ^[0-9]+$ ]]; then
+        attempts=0
+    fi
     sqlite3 "$DB" "INSERT OR REPLACE INTO retry_queue(path, attempts, last_attempt) VALUES ('$escaped_path', $attempts, datetime('now','localtime'));" 2>/dev/null || true
 }
 
@@ -159,49 +204,112 @@ remove_retry() {
 do_setup() {
     echo ""
     echo -e "${CYAN}==========================================================${NC}"
-    echo -e "${GREEN}  *  GoogleUnlimited - Linux Setup & Dependency Check${NC}"
-    echo -e "${GRAY}  Location: $SCRIPT_DIR${NC}"
+    echo -e "${GREEN}  *  GoogleUnlimited - Setup & Dependency Installer${NC}"
+    echo -e "${GRAY}  Location : $SCRIPT_DIR${NC}"
+    echo -e "${GRAY}  Platform : $OS ($(uname -m))${NC}"
     echo -e "${CYAN}==========================================================${NC}"
 
-    local missing=()
-    command -v inotifywait >/dev/null 2>&1 || missing+=("inotify-tools")
-    command -v sqlite3 >/dev/null 2>&1 || missing+=("sqlite3")
-    command -v curl >/dev/null 2>&1 || missing+=("curl")
+    if [ "$OS" = "Darwin" ]; then
+        # macOS dependency check
+        local missing=()
+        command -v fswatch >/dev/null 2>&1 || missing+=("fswatch")
+        command -v sqlite3 >/dev/null 2>&1 || missing+=("sqlite3")
+        command -v curl >/dev/null 2>&1 || missing+=("curl")
 
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${YELLOW}[Setup] Installing required packages: ${missing[*]}...${NC}"
-        if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y "${missing[@]}"
-        elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y "${missing[@]}"
-        elif command -v pacman >/dev/null 2>&1; then
-            sudo pacman -Sy --noconfirm "${missing[@]}"
-        elif command -v zypper >/dev/null 2>&1; then
-            sudo zypper install -y "${missing[@]}"
+        if [ ${#missing[@]} -gt 0 ]; then
+            echo -e "${YELLOW}[Setup] Missing required macOS tools: ${missing[*]}${NC}"
+            if command -v brew >/dev/null 2>&1; then
+                echo -e "${YELLOW}[Setup] Installing via Homebrew: brew install ${missing[*]}...${NC}"
+                brew install "${missing[@]}"
+            else
+                echo -e "${RED}[ERROR] Homebrew (brew) is not installed.${NC}"
+                echo "Please install Homebrew by running:"
+                echo '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+                echo "Then run: brew install ${missing[*]}"
+                exit 1
+            fi
         else
-            echo -e "${RED}[WARN] Could not identify package manager. Please install manually: ${missing[*]}${NC}"
+            echo -e "${GREEN}[OK] Required packages (fswatch, sqlite3, curl) are already installed.${NC}"
         fi
+
+        # Download gotohp-cli Universal for macOS (Apple Silicon + Intel)
+        local target_bin="$SCRIPT_DIR/gotohp-cli-macos-universal"
+        if [ ! -s "$target_bin" ]; then
+            echo -e "${YELLOW}[Setup] Downloading gotohp-cli Universal for macOS...${NC}"
+            rm -f "$target_bin"
+            if ! curl -fSL "https://github.com/xob0t/gotohp/releases/latest/download/gotohp-cli-macos-universal" -o "$target_bin"; then
+                echo -e "${RED}[ERROR] Failed to download gotohp-cli Universal for macOS.${NC}" >&2
+                rm -f "$target_bin"
+            fi
+        fi
+
+        # Security: strip Apple quarantine flag & set secure permissions
+        if [ -s "$target_bin" ]; then
+            xattr -d com.apple.quarantine "$target_bin" 2>/dev/null || true
+            chmod 700 "$target_bin" 2>/dev/null || true
+        fi
+
     else
-        echo -e "${GREEN}[OK] Required packages (inotify-tools, sqlite3, curl) are already installed.${NC}"
-    fi
+        # Linux dependency check
+        local missing=()
+        command -v inotifywait >/dev/null 2>&1 || missing+=("inotify-tools")
+        command -v sqlite3 >/dev/null 2>&1 || missing+=("sqlite3")
+        command -v curl >/dev/null 2>&1 || missing+=("curl")
 
-    # Verify/download gotohp-cli
-    local arch
-    arch="$(uname -m)"
-    local target_bin="$SCRIPT_DIR/gotohp-cli_amd64"
-    if [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
-        target_bin="$SCRIPT_DIR/gotohp-cli_arm64"
-        if [ ! -f "$target_bin" ]; then
-            echo -e "${YELLOW}[Setup] Downloading gotohp-cli for ARM64...${NC}"
-            curl -fSL "https://github.com/xob0t/gotohp/releases/latest/download/gotohp-cli_arm64" -o "$target_bin"
+        if [ ${#missing[@]} -gt 0 ]; then
+            echo -e "${YELLOW}[Setup] Installing required packages: ${missing[*]}...${NC}"
+            if command -v apt-get >/dev/null 2>&1; then
+                sudo apt-get update && sudo apt-get install -y "${missing[@]}"
+            elif command -v dnf >/dev/null 2>&1; then
+                sudo dnf install -y "${missing[@]}"
+            elif command -v pacman >/dev/null 2>&1; then
+                sudo pacman -Sy --noconfirm "${missing[@]}"
+            elif command -v zypper >/dev/null 2>&1; then
+                sudo zypper install -y "${missing[@]}"
+            else
+                echo -e "${RED}[WARN] Could not identify package manager. Please install manually: ${missing[*]}${NC}"
+            fi
+        else
+            echo -e "${GREEN}[OK] Required packages (inotify-tools, sqlite3, curl) are already installed.${NC}"
         fi
-    elif [ ! -f "$target_bin" ]; then
-        echo -e "${YELLOW}[Setup] Downloading gotohp-cli for x86_64...${NC}"
-        curl -fSL "https://github.com/xob0t/gotohp/releases/latest/download/gotohp-cli_amd64" -o "$target_bin"
+
+        # Verify/download gotohp-cli for Linux
+        local arch
+        arch="$(uname -m)"
+        local target_bin="$SCRIPT_DIR/gotohp-cli_amd64"
+        if [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
+            target_bin="$SCRIPT_DIR/gotohp-cli_arm64"
+            if [ ! -s "$target_bin" ]; then
+                echo -e "${YELLOW}[Setup] Downloading gotohp-cli for Linux ARM64...${NC}"
+                rm -f "$target_bin"
+                if ! curl -fSL "https://github.com/xob0t/gotohp/releases/latest/download/gotohp-cli_arm64" -o "$target_bin"; then
+                    echo -e "${RED}[ERROR] Failed to download gotohp-cli_arm64.${NC}" >&2
+                    rm -f "$target_bin"
+                fi
+            fi
+        elif [ ! -s "$target_bin" ]; then
+            echo -e "${YELLOW}[Setup] Downloading gotohp-cli for Linux x86_64...${NC}"
+            rm -f "$target_bin"
+            if ! curl -fSL "https://github.com/xob0t/gotohp/releases/latest/download/gotohp-cli_amd64" -o "$target_bin"; then
+                echo -e "${RED}[ERROR] Failed to download gotohp-cli_amd64.${NC}" >&2
+                rm -f "$target_bin"
+            fi
+        fi
+        [ -s "$target_bin" ] && chmod 700 "$target_bin" 2>/dev/null || true
     fi
 
-    chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/gotohp-cli* 2>/dev/null || true
-    echo -e "${GREEN}[OK] Execution permissions set.${NC}"
+    # Set execution permissions on scripts and binaries
+    chmod 755 "$SCRIPT_DIR"/*.sh 2>/dev/null || true
+    chmod 700 "$SCRIPT_DIR"/gotohp-cli* 2>/dev/null || true
+
+    # Security: Restrict permissions on sensitive configuration files
+    if [ -f "$SCRIPT_DIR/gotohp.config" ]; then
+        chmod 600 "$SCRIPT_DIR/gotohp.config" 2>/dev/null || true
+    fi
+    if [ -f "$DB" ]; then
+        chmod 600 "$DB" 2>/dev/null || true
+    fi
+    echo -e "${GREEN}[OK] Security permissions hardened (chmod 600 on secrets, 700 on binaries).${NC}"
 
     # Check credentials
     local creds_out
@@ -331,23 +439,37 @@ do_stop() {
         done
     fi
 
-    # Terminate orphaned inotifywait listeners
-    local ipids
-    ipids=$(pgrep -f "inotifywait -m -r -e close_write,moved_to" || true)
-    if [ -n "$ipids" ]; then
-        for ipid in $ipids; do
-            kill "$ipid" 2>/dev/null || true
-            echo -e "${GREEN}[OK] Stopped inotifywait listener PID $ipid${NC}"
-            stopped=1
-        done
-    fi
+    if [ "$OS" = "Darwin" ]; then
+        # Terminate macOS launchd agent if active
+        launchctl stop com.googleunlimited.watcher 2>/dev/null || true
+        local fpids
+        fpids=$(pgrep -f "fswatch.*$SCRIPT_DIR" || pgrep -f "fswatch" || true)
+        if [ -n "$fpids" ]; then
+            for fpid in $fpids; do
+                kill "$fpid" 2>/dev/null || true
+                echo -e "${GREEN}[OK] Stopped fswatch listener PID $fpid${NC}"
+                stopped=1
+            done
+        fi
+    else
+        # Terminate orphaned inotifywait listeners on Linux
+        local ipids
+        ipids=$(pgrep -f "inotifywait -m -r -e close_write,moved_to" || true)
+        if [ -n "$ipids" ]; then
+            for ipid in $ipids; do
+                kill "$ipid" 2>/dev/null || true
+                echo -e "${GREEN}[OK] Stopped inotifywait listener PID $ipid${NC}"
+                stopped=1
+            done
+        fi
 
-    # Terminate systemd user service if active
-    if command -v systemctl >/dev/null 2>&1; then
-        if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-            systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
-            echo -e "${GREEN}[OK] Stopped systemd user service '$SERVICE_NAME'${NC}"
-            stopped=1
+        # Terminate systemd user service if active
+        if command -v systemctl >/dev/null 2>&1; then
+            if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+                systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
+                echo -e "${GREEN}[OK] Stopped systemd user service '$SERVICE_NAME'${NC}"
+                stopped=1
+            fi
         fi
     fi
 
@@ -359,9 +481,59 @@ do_stop() {
 }
 
 # ---------------------------------------------------------------------
-# ACTION: ENABLE STARTUP (systemd)
+# ACTION: ENABLE STARTUP (launchd on macOS / systemd on Linux)
 # ---------------------------------------------------------------------
 do_enable_startup() {
+    if [ "$OS" = "Darwin" ]; then
+        echo -e "${CYAN}Enabling Google Photos Auto-Sync on startup (macOS launchd)...${NC}"
+        local plist_dir="$HOME/Library/LaunchAgents"
+        local plist_file="$plist_dir/com.googleunlimited.watcher.plist"
+        mkdir -p "$plist_dir"
+
+        cat << EOF > "$plist_file"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.googleunlimited.watcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$SCRIPT_DIR/google-unlimited.sh</string>
+        <string>watch</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$SCRIPT_DIR</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>
+EOF
+        chmod 644 "$plist_file"
+        if command -v launchctl >/dev/null 2>&1; then
+            launchctl unload "$plist_file" 2>/dev/null || true
+            launchctl load -w "$plist_file"
+        fi
+
+        echo ""
+        echo -e "${GREEN}==========================================================${NC}"
+        echo -e "${GREEN}  *  Auto-Sync has been enabled for macOS startup!${NC}"
+        echo -e "${GREEN}==========================================================${NC}"
+        echo "LaunchAgent:     $plist_file"
+        echo "Check status:    launchctl list | grep com.googleunlimited"
+        echo "View logs:       ./google-unlimited.sh logs"
+        echo "Disable anytime: ./google-unlimited.sh disable"
+        echo ""
+        return 0
+    fi
+
     echo -e "${CYAN}Enabling Google Photos Auto-Sync on startup (Linux systemd)...${NC}"
 
     if ! command -v systemctl >/dev/null 2>&1; then
@@ -414,10 +586,25 @@ EOF
 }
 
 # ---------------------------------------------------------------------
-# ACTION: DISABLE STARTUP (systemd)
+# ACTION: DISABLE STARTUP (launchd on macOS / systemd on Linux)
 # ---------------------------------------------------------------------
 do_disable_startup() {
     echo -e "${CYAN}Disabling Google Photos Auto-Sync startup service...${NC}"
+
+    if [ "$OS" = "Darwin" ]; then
+        local plist_file="$HOME/Library/LaunchAgents/com.googleunlimited.watcher.plist"
+        if [ -f "$plist_file" ]; then
+            launchctl unload -w "$plist_file" 2>/dev/null || true
+            rm -f "$plist_file"
+            echo -e "${GREEN}[OK] Removed LaunchAgent: $plist_file${NC}"
+        fi
+        echo ""
+        echo -e "${GREEN}==========================================================${NC}"
+        echo -e "${GREEN}  *  Google Photos Auto-Sync startup has been disabled.${NC}"
+        echo -e "${GREEN}==========================================================${NC}"
+        echo ""
+        return 0
+    fi
 
     if command -v systemctl >/dev/null 2>&1; then
         systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
@@ -575,9 +762,25 @@ do_watch() {
         exit 1
     fi
 
+    # Check watcher dependency
+    if [ "$OS" = "Darwin" ]; then
+        if ! command -v fswatch >/dev/null 2>&1; then
+            echo -e "${RED}[ERROR] 'fswatch' is required on macOS for real-time file monitoring.${NC}" >&2
+            echo -e "Please install it via Homebrew: ${YELLOW}brew install fswatch${NC}" >&2
+            echo "Or run: ./google-unlimited.sh setup" >&2
+            exit 1
+        fi
+    else
+        if ! command -v inotifywait >/dev/null 2>&1; then
+            echo -e "${RED}[ERROR] 'inotifywait' is required on Linux for real-time file monitoring.${NC}" >&2
+            echo -e "Please install inotify-tools or run: ./google-unlimited.sh setup" >&2
+            exit 1
+        fi
+    fi
+
     # Discover watched folders
     local watch_dirs=()
-    for folder in "$HOME/Downloads" "$HOME/Pictures" "$HOME/Desktop" "$HOME/Documents" "$HOME/Music" "$HOME/Videos"; do
+    for folder in "$HOME/Downloads" "$HOME/Pictures" "$HOME/Desktop" "$HOME/Documents" "$HOME/Music" "$HOME/Movies" "$HOME/Videos"; do
         if [ -d "$folder" ]; then
             watch_dirs+=("$folder")
         fi
@@ -590,7 +793,7 @@ do_watch() {
 
     echo ""
     echo -e "${CYAN}==========================================================${NC}"
-    echo -e "${GREEN}  *  GoogleUnlimited - Linux Watcher${NC}"
+    echo -e "${GREEN}  *  GoogleUnlimited - Watcher ($OS)${NC}"
     echo -e "${GRAY}  Location: $SCRIPT_DIR${NC}"
     echo -e "${GRAY}  Database: $DB${NC}"
     echo -e "${CYAN}==========================================================${NC}"
@@ -643,16 +846,27 @@ do_watch() {
         echo -e "${GREEN}[Phase 1] [OK] Startup sync complete ($file_count file(s)).${NC}"
     fi
 
-    # Phase 2: Inotify Watcher
-    echo ""
-    echo -e "${YELLOW}[Phase 2] Real-time watcher active.${NC}"
-    echo "  Waiting for new media... Press Ctrl+C to stop."
+    # Phase 2: Real-time Watcher
+    local watcher_pid=""
+    if [ "$OS" = "Darwin" ]; then
+        echo ""
+        echo -e "${YELLOW}[Phase 2] Real-time watcher active (fswatch).${NC}"
+        echo "  Waiting for new media... Press Ctrl+C to stop."
 
-    # Run inotifywait pipeline in the background so parent can trap signals cleanly
-    inotifywait -m -r -e close_write,moved_to,create --format '%w%f' "${watch_dirs[@]}" 2>/dev/null | while IFS= read -r new_path; do
-        invoke_upload "$new_path"
-    done &
-    local watcher_pid=$!
+        fswatch -r -e "/\\." "${watch_dirs[@]}" 2>/dev/null | while IFS= read -r new_path; do
+            invoke_upload "$new_path"
+        done &
+        watcher_pid=$!
+    else
+        echo ""
+        echo -e "${YELLOW}[Phase 2] Real-time watcher active (inotifywait).${NC}"
+        echo "  Waiting for new media... Press Ctrl+C to stop."
+
+        inotifywait -m -r -e close_write,moved_to,create --format '%w%f' "${watch_dirs[@]}" 2>/dev/null | while IFS= read -r new_path; do
+            invoke_upload "$new_path"
+        done &
+        watcher_pid=$!
+    fi
 
     cleanup() {
         # Untrap immediately to prevent recursive signal/exit loops
@@ -662,6 +876,11 @@ do_watch() {
         if [ -n "${watcher_pid:-}" ]; then
             pkill -P "$watcher_pid" 2>/dev/null || true
             kill "$watcher_pid" 2>/dev/null || true
+        fi
+        if [ "$OS" = "Darwin" ]; then
+            pkill -f "fswatch.*$SCRIPT_DIR" 2>/dev/null || true
+        else
+            pkill -f "inotifywait.*${watch_dirs[0]}" 2>/dev/null || true
         fi
         exit 0
     }
@@ -676,13 +895,17 @@ do_watch() {
 show_menu() {
     clear 2>/dev/null || true
     echo -e "${CYAN}==========================================================${NC}"
-    echo -e "${GREEN}  *  GoogleUnlimited - Linux Manager${NC}"
+    echo -e "${GREEN}  *  GoogleUnlimited - Unix Manager ($OS)${NC}"
     echo -e "${CYAN}==========================================================${NC}"
     echo "  [1] Start Live Watcher (Foreground)"
     echo "  [2] Check Backup Status"
     echo "  [3] View Activity Logs"
     echo "  [4] Run Setup & Dependency Installer"
-    echo "  [5] Enable Auto-Start on Boot (systemd)"
+    if [ "$OS" = "Darwin" ]; then
+        echo "  [5] Enable Auto-Start on Boot (macOS launchd)"
+    else
+        echo "  [5] Enable Auto-Start on Boot (Linux systemd)"
+    fi
     echo "  [6] Disable Auto-Start on Boot"
     echo "  [7] Stop Background Watcher"
     echo "  [0] Exit"
@@ -710,9 +933,9 @@ show_help() {
     echo "  watch             Start live real-time sync watcher (default)"
     echo "  status            Check upload count and pending retries"
     echo "  logs              View last 30 sync activity log entries"
-    echo "  setup             Install dependencies (inotify-tools, sqlite3)"
-    echo "  enable            Enable auto-start on boot via systemd"
-    echo "  disable           Disable systemd auto-start service"
+    echo "  setup             Install dependencies (fswatch/inotify-tools, sqlite3)"
+    echo "  enable            Enable auto-start on boot (launchd on macOS / systemd on Linux)"
+    echo "  disable           Disable auto-start service"
     echo "  stop              Stop running background watcher instances"
     echo "  creds             Pass creds commands directly to gotohp-cli"
     echo "  menu              Open interactive terminal menu"
