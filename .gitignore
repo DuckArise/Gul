@@ -1,0 +1,23 @@
+# Personal Database & State (DO NOT COMMIT)
+*.db
+*.db-wal
+*.db-shm
+gphotos.db
+
+# Authentication Credentials & Tokens (DO NOT COMMIT)
+gotohp.config
+*.config
+*.key
+*.token
+
+# Logs & Temporary Files
+*.log
+*.tmp
+*.bak
+
+# OS Metadata
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
