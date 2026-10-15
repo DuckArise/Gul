@@ -88,9 +88,20 @@ When you run `RunWatcher.bat`, it executes in two automated phases:
   ```
 
 ### 2. Silent Background Mode (`StartPhotosWatcher.vbs`)
-To have backups run automatically without any console window:
+To have backups run silently with zero terminal window:
 - Double-click **`StartPhotosWatcher.vbs`**.
-- To run on computer startup: Press `Win + R`, type `shell:startup`, and place a shortcut to `StartPhotosWatcher.vbs` in the folder.
+
+#### Start Automatically When Windows Turns On (Recommended)
+To have it automatically start in the background every time you turn on your PC:
+1. Press `Win + R` on your keyboard, type **`shell:startup`**, and hit **Enter**. (This opens your Windows Startup folder).
+2. Right-click inside the folder → **New** → **Shortcut**.
+3. Browse and select **`StartPhotosWatcher.vbs`** (or drag `StartPhotosWatcher.vbs` into the Startup folder while holding `Alt`).
+4. Click **Next** and **Finish**.
+
+Now, whenever you log into Windows, it will automatically run in the background.
+
+#### Stop the Background Watcher (`StopWatcher.bat`)
+To stop the background sync at any time, simply double-click **`StopWatcher.bat`**.
 
 ### 3. Check Backup Status (`CheckStatus.bat`)
 Double-click **`CheckStatus.bat`** anytime to view your sync health without interrupting active background sync:
