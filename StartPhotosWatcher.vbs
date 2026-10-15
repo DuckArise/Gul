@@ -20,5 +20,5 @@ If fso.FileExists(WshShell.ExpandEnvironmentStrings("%ProgramFiles%\PowerShell\7
     psExe = "pwsh.exe"
 End If
 
-command = psExe & " -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & ps1Path & """"
+command = psExe & " -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & ps1Path & """"
 WshShell.Run command, 0, False

@@ -55,6 +55,8 @@ PRAGMA synchronous=NORMAL;
 CREATE TABLE IF NOT EXISTS uploads (
     path        TEXT PRIMARY KEY,
     media_key   TEXT,
+    file_name   TEXT,
+    file_size   INTEGER,
     uploaded_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
 
@@ -75,13 +77,19 @@ CREATE INDEX IF NOT EXISTS idx_logs_ts    ON logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
 EOF
 
+# Schema migration for existing databases
+sqlite3 "$DB" "ALTER TABLE uploads ADD COLUMN file_name TEXT;" 2>/dev/null || true
+sqlite3 "$DB" "ALTER TABLE uploads ADD COLUMN file_size INTEGER;" 2>/dev/null || true
+sqlite3 "$DB" "CREATE INDEX IF NOT EXISTS idx_uploads_file ON uploads(file_name, file_size);" 2>/dev/null || true
+
 # Logging helper
 write_log() {
     local msg="$1"
     local level="${2:-INFO}"
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    sqlite3 "$DB" "INSERT INTO logs(level, message) VALUES ('$level', '$(echo "$msg" | sed "s/'/''/g")');" 2>/dev/null || true
+    local escaped_msg="${msg//\'/\'\'}"
+    sqlite3 "$DB" "INSERT INTO logs(level, message) VALUES ('$level', '$escaped_msg');" 2>/dev/null || true
     echo "[$ts][$level] $msg"
 }
 
@@ -103,18 +111,30 @@ MIN_BYTES=10240
 
 is_uploaded() {
     local fpath="$1"
+    local fname="${2:-$(basename "$fpath")}"
+    local fsize="${3:-0}"
+    local escaped_path="${fpath//\'/\'\'}"
+    local escaped_name="${fname//\'/\'\'}"
+
     local count
-    count="$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE path = '$(echo "$fpath" | sed "s/'/''/g")';" 2>/dev/null || echo 0)"
-    [ "$count" -gt 0 ]
+    if [ "$fsize" -gt 0 ]; then
+        count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE path = '$escaped_path' OR (file_name = '$escaped_name' AND file_size = $fsize AND file_size > 0);" 2>/dev/null || echo 0)
+    else
+        count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE path = '$escaped_path';" 2>/dev/null || echo 0)
+    fi
+    [ -n "$count" ] && [ "$count" -gt 0 ]
 }
 
 save_upload() {
     local fpath="$1"
     local mkey="$2"
-    local escaped_path
-    escaped_path="$(echo "$fpath" | sed "s/'/''/g")"
+    local fname="${3:-$(basename "$fpath")}"
+    local fsize="${4:-0}"
+    local escaped_path="${fpath//\'/\'\'}"
+    local escaped_name="${fname//\'/\'\'}"
+
     sqlite3 "$DB" << EOF
-INSERT OR REPLACE INTO uploads(path, media_key) VALUES ('$escaped_path', '$mkey');
+INSERT OR REPLACE INTO uploads(path, media_key, file_name, file_size) VALUES ('$escaped_path', '$mkey', '$escaped_name', $fsize);
 DELETE FROM retry_queue WHERE path = '$escaped_path';
 EOF
 }
@@ -122,15 +142,13 @@ EOF
 save_retry() {
     local fpath="$1"
     local attempts="$2"
-    local escaped_path
-    escaped_path="$(echo "$fpath" | sed "s/'/''/g")"
+    local escaped_path="${fpath//\'/\'\'}"
     sqlite3 "$DB" "INSERT OR REPLACE INTO retry_queue(path, attempts, last_attempt) VALUES ('$escaped_path', $attempts, datetime('now','localtime'));" 2>/dev/null || true
 }
 
 remove_retry() {
     local fpath="$1"
-    local escaped_path
-    escaped_path="$(echo "$fpath" | sed "s/'/''/g")"
+    local escaped_path="${fpath//\'/\'\'}"
     sqlite3 "$DB" "DELETE FROM retry_queue WHERE path = '$escaped_path';" 2>/dev/null || true
 }
 
@@ -176,6 +194,8 @@ wait_for_file_ready() {
 
 invoke_upload() {
     local fpath="$1"
+    # Skip directories (from inotify directory creation events) and non-existent paths
+    [ -d "$fpath" ] && return
     [ ! -f "$fpath" ] && return
     case "$fpath" in
         */Modules/*) return ;;
@@ -188,10 +208,6 @@ invoke_upload() {
         return
     fi
 
-    if is_uploaded "$fpath"; then
-        return
-    fi
-
     local fname
     fname="$(basename "$fpath")"
     local size_bytes
@@ -199,18 +215,25 @@ invoke_upload() {
     local size_mb
     size_mb=$(awk -v b="$size_bytes" 'BEGIN { printf "%.2f", b/1048576 }')
 
+    # Dual-boot cross-platform deduplication check
+    if is_uploaded "$fpath" "$fname" "$size_bytes"; then
+        return
+    fi
+
     echo ""
     echo "[$(date '+%H:%M:%S')] Detected  : $fname (${size_mb} MB)"
     echo "             Path      : $fpath"
 
     wait_for_file_ready "$fpath"
     local status=$?
+    local escaped_path="${fpath//\'/\'\'}"
+
     if [ $status -eq 2 ]; then
         remove_retry "$fpath"
         return
     elif [ $status -eq 1 ]; then
         local prev
-        prev=$(sqlite3 "$DB" "SELECT attempts FROM retry_queue WHERE path = '$(echo "$fpath" | sed "s/'/''/g")';" 2>/dev/null || echo 0)
+        prev=$(sqlite3 "$DB" "SELECT attempts FROM retry_queue WHERE path = '$escaped_path';" 2>/dev/null || echo 0)
         [ -z "$prev" ] && prev=0
         write_log "File still downloading/locked ($fname) - remaining in queue." "WARN"
         save_retry "$fpath" "$prev"
@@ -231,11 +254,11 @@ invoke_upload() {
         mkey="$(echo "$output" | grep -o '"mediaKey": *"[^"]*"' | head -n1 | cut -d'"' -f4 || echo "")"
         echo "  [####################] 100% [OK] Uploaded in ${duration}s: $fname (${size_mb} MB)"
         write_log "SUCCESS | $fname (${size_mb} MB in ${duration}s)" "OK"
-        save_upload "$fpath" "$mkey"
+        save_upload "$fpath" "$mkey" "$fname" "$size_bytes"
     else
         echo "  [--------------------] FAILED in ${duration}s: $fname"
         local attempts
-        attempts=$(sqlite3 "$DB" "SELECT attempts FROM retry_queue WHERE path = '$(echo "$fpath" | sed "s/'/''/g")';" 2>/dev/null || echo 0)
+        attempts=$(sqlite3 "$DB" "SELECT attempts FROM retry_queue WHERE path = '$escaped_path';" 2>/dev/null || echo 0)
         [ -z "$attempts" ] && attempts=0
         attempts=$((attempts + 1))
         if [ "$attempts" -ge 3 ]; then
@@ -265,9 +288,13 @@ file_count=0
 while IFS= read -r -d '' file; do
     ext="${file##*.}"
     ext="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
-    if echo "$ext" | grep -qE "$VALID_EXT" && ! is_uploaded "$file"; then
-        file_count=$((file_count + 1))
-        invoke_upload "$file"
+    if echo "$ext" | grep -qE "$VALID_EXT"; then
+        fname="$(basename "$file")"
+        size_bytes=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+        if ! is_uploaded "$file" "$fname" "$size_bytes"; then
+            file_count=$((file_count + 1))
+            invoke_upload "$file"
+        fi
     fi
 done < <(find "${WATCH_DIRS[@]}" -type f -print0 2>/dev/null)
 
@@ -275,9 +302,13 @@ done < <(find "${WATCH_DIRS[@]}" -type f -print0 2>/dev/null)
 RETRY_LIST=$(sqlite3 "$DB" "SELECT path FROM retry_queue WHERE attempts < 3;" 2>/dev/null || true)
 if [ -n "$RETRY_LIST" ]; then
     while IFS= read -r rfile; do
-        if [ -f "$rfile" ] && ! is_uploaded "$rfile"; then
-            file_count=$((file_count + 1))
-            invoke_upload "$rfile"
+        if [ -f "$rfile" ]; then
+            rfname="$(basename "$rfile")"
+            rsize_bytes=$(stat -c%s "$rfile" 2>/dev/null || stat -f%z "$rfile" 2>/dev/null || echo 0)
+            if ! is_uploaded "$rfile" "$rfname" "$rsize_bytes"; then
+                file_count=$((file_count + 1))
+                invoke_upload "$rfile"
+            fi
         fi
     done <<< "$RETRY_LIST"
 fi
@@ -288,7 +319,7 @@ else
     echo "[Phase 1] [OK] Startup sync complete ($file_count file(s))."
 fi
 
-# Phase 2 Real-Time Inotify Watcher
+# Phase 2 Real-Time Inotify Watcher (with directory creation watch)
 echo ""
 echo "[Phase 2] Real-time watcher active."
 echo "  Waiting for new downloads... Press Ctrl+C to stop."
@@ -297,10 +328,11 @@ cleanup() {
     echo ""
     echo "Stopping watcher..."
     pkill -P $$ 2>/dev/null || true
+    kill 0 2>/dev/null || true
     exit 0
 }
-trap cleanup SIGINT SIGTERM
+trap cleanup SIGINT SIGTERM EXIT
 
-inotifywait -m -r -e close_write,moved_to --format '%w%f' "${WATCH_DIRS[@]}" 2>/dev/null | while IFS= read -r new_path; do
+inotifywait -m -r -e close_write,moved_to,create --format '%w%f' "${WATCH_DIRS[@]}" 2>/dev/null | while IFS= read -r new_path; do
     invoke_upload "$new_path"
 done

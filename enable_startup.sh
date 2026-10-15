@@ -52,7 +52,10 @@ systemctl --user restart "$SERVICE_NAME"
 
 # Enable lingering if loginctl is available so the service runs in background without terminal
 if command -v loginctl >/dev/null 2>&1; then
-    loginctl enable-linger "$USER" 2>/dev/null || true
+    CURRENT_USER="${USER:-$(id -un 2>/dev/null || whoami 2>/dev/null || echo "")}"
+    if [ -n "$CURRENT_USER" ]; then
+        loginctl enable-linger "$CURRENT_USER" 2>/dev/null || true
+    fi
 fi
 
 echo ""

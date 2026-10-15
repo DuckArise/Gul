@@ -110,13 +110,23 @@ $script:MAX_RETRY = 3       # Max retry attempts per file
 $script:LOG_RETENTION_DAYS = 30
 
 # In-memory cache for O(1) lookups
-$script:history  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-$script:retryMap = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::OrdinalIgnoreCase)
-$script:inFlight = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+$script:history    = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+$script:fileLookup = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+$script:retryMap   = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::OrdinalIgnoreCase)
+$script:inFlight   = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
 # Mutex for thread-safe DB access (keyed to database path)
 $mutexName = "GotohpDBMutex_" + [Math]::Abs($script:DB.ToLower().GetHashCode())
 $script:dbMutex = New-Object System.Threading.Mutex($false, $mutexName)
+
+# Safe console writer (never throws IOException in headless/silent background mode)
+function Safe-ConsoleWrite([string]$text) {
+    try {
+        if ([Environment]::UserInteractive) {
+            [Console]::Write($text)
+        }
+    } catch {}
+}
 
 # ---------------------------------------------------------------------
 # PORTABLE PSSQLITE ENGINE LOADER (Zero configuration required)
@@ -192,6 +202,17 @@ CREATE INDEX IF NOT EXISTS idx_logs_ts    ON logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
 "@
     Invoke-SqliteQuery -DataSource $script:DB -Query $ddl | Out-Null
+
+    # Schema migration for dual-boot cross-platform tracking
+    try {
+        Invoke-SqliteQuery -DataSource $script:DB -Query "ALTER TABLE uploads ADD COLUMN file_name TEXT;" -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
+    try {
+        Invoke-SqliteQuery -DataSource $script:DB -Query "ALTER TABLE uploads ADD COLUMN file_size INTEGER;" -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
+    try {
+        Invoke-SqliteQuery -DataSource $script:DB -Query "CREATE INDEX IF NOT EXISTS idx_uploads_file ON uploads(file_name, file_size);" -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
 }
 
 # ---------------------------------------------------------------------
@@ -227,10 +248,13 @@ function Write-Log([string]$msg, [string]$level = "INFO") {
 # CACHE & PRUNE
 # ---------------------------------------------------------------------
 function Load-Cache {
-    $rows = Invoke-SqliteQuery -DataSource $script:DB -Query "SELECT path FROM uploads"
+    $rows = Invoke-SqliteQuery -DataSource $script:DB -Query "SELECT path, file_name, file_size FROM uploads"
     foreach ($r in $rows) {
         if ($r.path) {
             $script:history.Add($r.path) | Out-Null
+        }
+        if ($r.file_name -and $r.file_size) {
+            $script:fileLookup.Add("$($r.file_name)|$($r.file_size)") | Out-Null
         }
     }
     Write-Log "Cache loaded: $($script:history.Count) uploaded files."
@@ -249,19 +273,27 @@ function Load-Cache {
         -Query "DELETE FROM logs WHERE timestamp < datetime('now', '-$($script:LOG_RETENTION_DAYS) days')" | Out-Null
 }
 
-function Save-Upload([string]$path, [string]$mediaKey) {
+function Save-Upload([string]$path, [string]$mediaKey, [string]$fileName = "", [long]$fileSize = 0) {
+    if (-not $fileName) { $fileName = [System.IO.Path]::GetFileName($path) }
+    if ($fileSize -le 0 -and [System.IO.File]::Exists($path)) {
+        try { $fileSize = (New-Object System.IO.FileInfo($path)).Length } catch {}
+    }
+
     $hasMutex = $false
     try {
         $hasMutex = $script:dbMutex.WaitOne(3000)
         if ($hasMutex) {
             Invoke-SqliteQuery -DataSource $script:DB `
-                -Query "INSERT OR REPLACE INTO uploads(path, media_key) VALUES(@p, @k)" `
-                -SqlParameters @{ p = $path; k = $mediaKey } | Out-Null
+                -Query "INSERT OR REPLACE INTO uploads(path, media_key, file_name, file_size) VALUES(@p, @k, @fn, @fs)" `
+                -SqlParameters @{ p = $path; k = $mediaKey; fn = $fileName; fs = $fileSize } | Out-Null
             Invoke-SqliteQuery -DataSource $script:DB `
                 -Query "DELETE FROM retry_queue WHERE path = @p" `
                 -SqlParameters @{ p = $path } | Out-Null
         }
         $script:history.Add($path) | Out-Null
+        if ($fileName -and $fileSize -gt 0) {
+            $script:fileLookup.Add("$fileName|$fileSize") | Out-Null
+        }
         $null = $script:retryMap.Remove($path)
     } finally {
         if ($hasMutex) {
@@ -350,11 +382,21 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
     $ext = [System.IO.Path]::GetExtension($path).ToLower()
     if (-not $script:EXT.Contains($ext)) { return }
     if ($script:history.Contains($path)) { return }
+
+    $name = [System.IO.Path]::GetFileName($path)
+    $fileInfo = New-Object System.IO.FileInfo($path)
+    if (-not $fileInfo.Exists) { return }
+
+    # Dual-boot cross-platform deduplication check (avoids duplicate uploads across OSes)
+    $lookupKey = "$name|$($fileInfo.Length)"
+    if ($script:fileLookup.Contains($lookupKey)) {
+        Save-Upload $path "DUAL_BOOT_SYNC" $name $fileInfo.Length
+        return
+    }
+
     if (-not $script:inFlight.Add($path)) { return }
 
     try {
-        $name = [System.IO.Path]::GetFileName($path)
-        $fileInfo = New-Object System.IO.FileInfo($path)
         $fileSizeMB = [Math]::Round($fileInfo.Length / 1MB, 2)
         if ($fileSizeMB -lt 1) {
             $sizeLabel = "$([Math]::Round($fileInfo.Length / 1KB, 1)) KB"
@@ -410,7 +452,7 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
                 $barChars[($step + $k) % $barWidth] = [char]"#"
             }
             $activeBar = -join $barChars
-            [Console]::Write("`r  [$activeBar] Uploading $sizeLabel ($($elapsedSec)s)...   ")
+            Safe-ConsoleWrite("`r  [$activeBar] Uploading $sizeLabel ($($elapsedSec)s)...   ")
         }
 
         $stdout = $proc.StandardOutput.ReadToEnd()
@@ -424,11 +466,11 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
             if ($stdout -match '"mediaKey":\s*"([^"]+)"') {
                 $mediaKey = $matches[1]
             }
-            [Console]::Write("`r  [$doneBar] 100% [OK] Uploaded in $($totalTime)s: $name ($sizeLabel)        `n")
+            Safe-ConsoleWrite("`r  [$doneBar] 100% [OK] Uploaded in $($totalTime)s: $name ($sizeLabel)        `n")
             Write-Log "SUCCESS | $name ($sizeLabel in $($totalTime)s)" "OK"
-            Save-Upload $path $mediaKey
+            Save-Upload $path $mediaKey $name $fileInfo.Length
         } else {
-            [Console]::Write("`r  [--------------------] FAILED in $($totalTime)s: $name                      `n")
+            Safe-ConsoleWrite("`r  [--------------------] FAILED in $($totalTime)s: $name                      `n")
             $attempts = 1
             if ($script:retryMap.ContainsKey($path)) {
                 $attempts = $script:retryMap[$path] + 1
@@ -571,7 +613,8 @@ foreach ($dir in $script:WATCH_DIRS) {
             Where-Object {
                 $script:EXT.Contains($_.Extension.ToLower()) -and
                 -not $_.FullName.Contains("\Modules\") -and
-                -not $script:history.Contains($_.FullName)
+                -not $script:history.Contains($_.FullName) -and
+                -not $script:fileLookup.Contains("$($_.Name)|$($_.Length)")
             } | ForEach-Object { $unrecorded.Add($_) }
     } catch {
         Write-Log "Scan error in $dir - $_" "WARN"
@@ -654,6 +697,7 @@ try {
                             $script:EXT.Contains($_.Extension.ToLower()) -and
                             -not $_.FullName.Contains("\Modules\") -and
                             -not $script:history.Contains($_.FullName) -and
+                            -not $script:fileLookup.Contains("$($_.Name)|$($_.Length)") -and
                             -not $script:inFlight.Contains($_.FullName) -and
                             $_.LastWriteTime -gt ([DateTime]::Now.AddMinutes(-10))
                         } | ForEach-Object {

@@ -76,8 +76,12 @@ else
     echo "=========================================================="
     echo "  1. On any browser, open Google Embedded Setup sign-in."
     echo "  2. Retrieve your 'oauth_token' cookie from DevTools."
+    CONFIG_HINT=""
+    if [ -f "$SCRIPT_DIR/gotohp.config" ]; then
+        CONFIG_HINT="--config gotohp.config "
+    fi
     echo "  3. Run:"
-    echo "     ./$([ -f "$GOTOHP_BIN" ] && basename "$GOTOHP_BIN" || echo "gotohp-cli_amd64") creds add \"<oauth_token>\""
+    echo "     ./$([ -f "$GOTOHP_BIN" ] && basename "$GOTOHP_BIN" || echo "gotohp-cli_amd64") ${CONFIG_HINT}creds add \"<oauth_token>\""
     echo "=========================================================="
 fi
 
