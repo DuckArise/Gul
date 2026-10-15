@@ -1,7 +1,7 @@
 # GoogleUnlimited
 
-> **Zero-Quota, Unlimited Google Photos Auto-Sync for Windows**  
-> Native Windows background watcher that automatically uploads photos and videos with **Pixel original quality unlimited backup** — without WSL, WSA, Android emulators, or Morphe crashes.
+> **Zero-Quota, Unlimited Google Photos Auto-Sync for Windows & Linux**  
+> Native background watcher that automatically uploads photos and videos with **Google Pixel original quality unlimited backup** — without WSL, WSA, Android emulators, or Morphe crashes.
 
 <p align="center">
   <img src="reddit_showcase.jpg" alt="GoogleUnlimited Showcase" width="100%" />
@@ -11,13 +11,16 @@
 
 ## Features
 
-- **Unlimited Google Photos Backup**: Spoofs Google Pixel mobile upload API (`xob0t/gotohp`) so all uploaded photos and videos consume **0 bytes of Google Drive / Google One storage**.
-- **100% Native Windows**: No WSL2, no Windows Subsystem for Android, no virtual machines, no Morphe/Tensor NPU emulation crashes.
-- **Portable & Zero-Install**: Runs from any directory, on any Windows PC (Windows 10 / 11), on both Windows PowerShell 5.1 and PowerShell 7+.
-- **Real-Time Auto-Sync**: Monitors standard user folders instantly when files are downloaded or saved, plus runs periodic sweeps every 30 seconds.
+- **Unlimited Google Photos Backup**: Spoofs Google Pixel mobile upload API ([`xob0t/gotohp`](https://github.com/xob0t/gotohp)) so all uploaded photos and videos consume **0 bytes of Google Drive / Google One storage**.
+- **Cross-Platform (Windows & Linux)**: Native PowerShell engine on Windows and native POSIX Bash + `inotify` engine on Linux. No emulators or virtual machines.
+- **Dual-Boot Interoperability**: Windows and Linux scripts share the exact same SQLite database schema (`gphotos.db`), allowing shared partition or dual-boot setups to seamlessly avoid duplicate uploads.
+- **Portable & Zero-Install**: Runs from any directory, on any PC or USB drive without system-wide installation.
+- **Real-Time Auto-Sync**: Monitors standard user folders instantly when files are downloaded or saved, with debounce protection for active downloads.
 - **Embedded SQLite Tracking**: Tracks every upload in `gphotos.db` — zero duplicate re-uploads, crash-resilient with automatic retry queues.
 - **Live Terminal Progress Bar**: Interactive runner with real-time dynamic progress bar, elapsed timer, and file size indicator.
-- **Silent Background Launcher**: One-click VBScript launcher to run silently in the background on startup with no terminal window.
+- **Background Auto-Start**: 
+  - Windows: 1-click installer (`EnableStartup.bat`) or silent VBScript launcher (`StartPhotosWatcher.vbs`).
+  - Linux: 1-click systemd user unit installer (`./enable_startup.sh`).
 
 ---
 
@@ -27,137 +30,148 @@
 GoogleUnlimited/
 │
 ├── Modules/
-│   └── PSSQLite/             # Bundled portable SQLite engine (x86, x64, .NET Framework & Core)
+│   └── PSSQLite/             # Bundled portable SQLite engine for Windows PowerShell
 │
-├── gotohp-cli-x64.exe        # High-performance CLI uploader with Pixel spoofing
-├── gotohp-x64.exe            # Desktop GUI for easy one-click Google OAuth sign-in
+├── gotohp-cli-x64.exe        # Windows 64-bit CLI uploader with Pixel spoofing
+├── gotohp-x64.exe            # Windows desktop GUI for one-click Google OAuth sign-in
+├── gotohp-cli_amd64          # Native Linux x86_64 ELF binary
 │
-├── RunWatcher.bat            # Interactive launcher (shows live terminal & animated progress)
-├── StartPhotosWatcher.vbs    # Background launcher (runs silently with zero window)
-├── EnableStartup.bat         # 1-click installer: auto-starts watcher on Windows boot
-├── DisableStartup.bat        # 1-click uninstaller: removes watcher from Windows boot
-├── StopWatcher.bat           # Stops any running background watcher instances
-├── ViewLogs.bat              # Displays recent sync activity logs with timestamps
-├── CheckStatus.bat           # Status checker (shows upload count, recent uploads, retries)
+│   # --- Windows Scripts ---
+├── RunWatcher.bat            # Windows interactive launcher (shows live progress)
+├── StartPhotosWatcher.vbs    # Windows silent background launcher (zero window)
+├── EnableStartup.bat         # Windows 1-click auto-start on boot installer
+├── DisableStartup.bat        # Windows 1-click auto-start uninstaller
+├── StopWatcher.bat           # Stops running Windows background watcher
+├── ViewLogs.bat              # Displays recent sync activity logs
+├── CheckStatus.bat           # Shows upload statistics and retry queue
+├── WatchAndUpload.ps1        # Core Windows PowerShell orchestrator
 │
-├── WatchAndUpload.ps1        # Core PowerShell orchestrator (engine, watcher, SQLite cache)
+│   # --- Linux Scripts ---
+├── setup_linux.sh            # Linux 1-command installer (dependencies + binary + chmod)
+├── watch_and_upload.sh       # Core Linux Bash watcher (inotify + SQLite engine)
+├── enable_startup.sh         # Linux 1-click systemd user auto-start installer
+├── disable_startup.sh        # Linux 1-click systemd user auto-start uninstaller
+├── stop_watcher.sh           # Stops running Linux background watcher & inotifywait
+├── view_logs.sh              # Linux terminal activity log viewer with colors
+├── check_status.sh           # Linux terminal status & queue viewer
+├── google-unlimited.service  # systemd user service unit template
+│
 ├── .gitignore                # Protects credentials, tokens, and personal databases
 └── README.md                 # Documentation
 ```
 
 ---
 
-## Setup Process (Any New Windows PC)
+## Windows Setup & Usage
 
-Setting up on a new device takes under 1 minute:
-
-### 1. Download or Clone the Repository
-Clone the repo or download as a ZIP and extract it to any folder of your choice (e.g. `C:\GoogleUnlimited`, `D:\Tools\GoogleUnlimited`, or on a USB drive):
+### 1. Download or Clone
 ```cmd
 git clone https://github.com/shishir0x/GoogleUnlimited.git
 ```
 
 ### 2. Sign In to Google Photos (One-Time)
-
-To spoof Google Pixel unlimited backup, `gotohp` authenticates via Google's Embedded Setup token:
-
 1. Double-click **`gotohp-x64.exe`** and click **Add Google account**.
-2. Click **Open Google sign-in** and sign in with the Google account you want to use.
+2. Click **Open Google sign-in** and sign in with your Google account.
 3. Sign in on the Google Embedded Setup page and click **I agree**.  
-   *(Note: The page may keep loading / buffering forever; this is completely normal and expected!)*
-4. Open your browser Developer Tools (press **F12** or right-click anywhere and choose **Inspect**):
-   - Go to the **Application** tab (Chrome / Edge / Brave) or **Storage** tab (Firefox).
-   - Under the **Cookies** section in the left panel, click **`https://accounts.google.com`**.
-   - Find the cookie named **`oauth_token`** and copy only its value.
-5. Return to **`gotohp`**, paste the token value into the input field, and click **Connect account**.
-6. Once connected, your auth is securely saved locally. You can now close the GUI window.
+   *(Note: The page buffering indefinitely is completely normal and expected).*
+4. Open browser Developer Tools (**F12**):
+   - Go to **Application** tab (Chrome/Edge/Brave) or **Storage** tab (Firefox).
+   - Under **Cookies**, click `https://accounts.google.com`.
+   - Copy the value of the **`oauth_token`** cookie.
+5. In `gotohp`, paste the token and click **Connect account**.
+6. Once connected, your credentials are saved locally. Close the GUI.
 
-### 3. Start Syncing
-Choose how you want to run it:
-- **Interactive Mode**: Double-click **`RunWatcher.bat`**  
-  Opens a terminal showing real-time folder scans, detected files, and live animated upload progress bars.
-- **Silent Background Mode**: Double-click **`StartPhotosWatcher.vbs`**  
-  Launches invisibly in the background.
+### 3. Run on Windows
+- **Interactive Mode**: Double-click **`RunWatcher.bat`** (shows live progress bars).
+- **Background Mode**: Double-click **`StartPhotosWatcher.vbs`** (silent, zero window).
+- **Auto-Start on Boot**: Double-click **`EnableStartup.bat`** (or **`DisableStartup.bat`** to remove).
+- **Check Status / Logs**: Double-click **`CheckStatus.bat`** or **`ViewLogs.bat`**.
+- **Stop Watcher**: Double-click **`StopWatcher.bat`**.
 
 ---
 
-## How to Use
+## Linux Setup & Usage
 
-### 1. Interactive Watcher (`RunWatcher.bat`)
-When you run `RunWatcher.bat`, it executes in two automated phases:
-- **Phase 1 (Startup Scan)**: Scans all monitored folders for existing unrecorded media and syncs them.
-- **Phase 2 (Real-Time Watcher)**: Listens for newly saved, downloaded, or modified photos and videos and uploads them instantly with a live animated progress bar:
-  ```text
-  [20:10:31] Detected  : holiday_sunset.jpg (1.4 MB)
-               Path      : C:\Users\User\Downloads\holiday_sunset.jpg
-    [####################] 100% [OK] Uploaded in 4.2s: holiday_sunset.jpg (1.4 MB)
-  [2026-10-15 20:10:35][OK] SUCCESS | holiday_sunset.jpg (1.4 MB in 4.2s)
+GoogleUnlimited runs natively on any Linux distribution (Ubuntu, Debian, Fedora, Arch Linux, openSUSE, etc.) using `inotify-tools`, `sqlite3`, and the native Linux `gotohp` binary.
+
+### 1. Clone the Repository
+```bash
+git clone https://github.com/shishir0x/GoogleUnlimited.git
+cd GoogleUnlimited
+```
+
+### 2. One-Command Setup
+Run the automated Linux setup script:
+```bash
+chmod +x setup_linux.sh
+./setup_linux.sh
+```
+What this does automatically:
+- Detects your package manager (`apt`, `dnf`, `pacman`, `zypper`) and installs `inotify-tools`, `sqlite3`, and `curl` if not already installed.
+- Detects your architecture (`x86_64` or `aarch64` / `arm64`) and ensures the proper native binary is ready.
+- Sets execute permissions (`chmod +x`) on all scripts.
+
+### 3. Sign In (One-Time)
+Run:
+```bash
+./gotohp-cli_amd64 creds add "<oauth_token>"
+```
+*(If on ARM64, use `./gotohp-cli_arm64 creds add "<oauth_token>"`)*
+
+To get the `oauth_token`:
+1. In any web browser, open the Google Embedded Setup sign-in page.
+2. Sign in and open browser Developer Tools (**F12**).
+3. Under **Cookies** -> `https://accounts.google.com`, copy the **`oauth_token`** cookie value.
+
+### 4. Run on Linux
+- **Interactive Mode**:
+  ```bash
+  ./watch_and_upload.sh
   ```
+  Runs the startup scan (Phase 1) followed by real-time `inotify` monitoring (Phase 2).
 
-### 2. Silent Background Mode (`StartPhotosWatcher.vbs`)
-To have backups run silently with zero terminal window:
-- Double-click **`StartPhotosWatcher.vbs`**.
+- **Auto-Start on Boot (systemd user service)**:
+  ```bash
+  ./enable_startup.sh
+  ```
+  This creates, enables, and immediately starts a `systemd` user service (`google-unlimited.service`) that automatically launches the sync watcher on system boot and keeps it running quietly in the background.
 
-#### Start Automatically When Windows Turns On (Recommended)
-You have two simple ways to enable auto-start on boot:
+- **Check Status**:
+  ```bash
+  ./check_status.sh
+  ```
+  Displays total uploaded files, pending retries, and the last 10 uploads.
 
-- **Option A (1-Click Method)**:
-  Double-click **`EnableStartup.bat`**.  
-  *(To disable auto-start later, simply double-click **`DisableStartup.bat`**).*
+- **View Activity Logs**:
+  ```bash
+  ./view_logs.sh
+  ```
+  Displays the last 30 timestamped activity events with color-coded log levels (`OK`, `WARN`, `ERROR`).
 
-- **Option B (Manual Method)**:
-  1. Press `Win + R` on your keyboard, type **`shell:startup`**, and hit **Enter**.
-  2. Right-click inside the Startup folder → **New** → **Shortcut**.
-  3. Browse and select **`StartPhotosWatcher.vbs`** (or drag `StartPhotosWatcher.vbs` into the folder while holding `Alt`).
-  4. Click **Next** and **Finish**.
+- **Stop Watcher**:
+  ```bash
+  ./stop_watcher.sh
+  ```
+  Stops any running interactive or background watcher instances.
 
-Now, whenever you log into Windows, the sync watcher will run quietly in the background.
-
-#### Stop the Background Watcher (`StopWatcher.bat`)
-To stop the background sync at any time, simply double-click **`StopWatcher.bat`**.
-
-### 3. Check Backup Status (`CheckStatus.bat`)
-Double-click **`CheckStatus.bat`** anytime to view your sync health without interrupting active background sync:
-```text
-==========================================================
-  *  Google Photos Sync Status
-  Database: C:\GoogleUnlimited\gphotos.db
-==========================================================
-  Total Uploaded Files : 133
-  Pending Retries      : 0
-
-  Last 10 Uploads:
-    [2026-10-15 20:10:36] pexels-ainc-t-76908403-37156188.jpg
-    [2026-10-15 20:10:15] pexels-merve-aktas-yalman-2160736635-38224815.jpg
-    [2026-10-15 20:07:34] pexels-roselene-de-koning-791440941-31630142.jpg
-==========================================================
-```
-
-### 4. View Activity Logs (`ViewLogs.bat`)
-Double-click **`ViewLogs.bat`** to view the last 30 timestamped activity events (successes, retries, scan results) recorded in SQLite:
-```text
-==========================================================
-  *  Google Photos Sync - Activity Logs (Last 30)
-  Database: C:\GoogleUnlimited\gphotos.db
-==========================================================
-[2026-10-15 20:10:36][OK] SUCCESS | photo.jpg (1.4 MB in 5.9s)
-[2026-10-15 20:17:18][INFO] Cache loaded: 133 uploaded files.
-[2026-10-15 20:35:01][OK] SUCCESS | Screenshot.png (10.4 KB in 4.9s)
-==========================================================
-```
+- **Disable Startup Service**:
+  ```bash
+  ./disable_startup.sh
+  ```
 
 ---
 
 ## Monitored Folders (Dynamic Resolution)
 
-The watcher automatically detects standard user folders on whatever drive or path they exist on:
+The watcher monitors standard user directories across both operating systems:
 - `Downloads`
 - `Pictures`
 - `Desktop`
 - `Documents`
 - `Music`
+- `Videos`
 
-> **Note**: Even if your folders are relocated (e.g. `D:\Downloads`), stored on secondary drives, or redirected by **OneDrive** (`C:\Users\...\OneDrive\Pictures`), the script queries the Windows Shell API and registry to find the real paths automatically.
+On Windows, directories are dynamically resolved via Windows Shell API & Registry (handling custom drive paths and OneDrive redirection). On Linux, standard XDG user directories are automatically resolved.
 
 ### Supported File Extensions
 - **Images**: `.jpg`, `.jpeg`, `.png`, `.heic`, `.webp`, `.gif`, `.dng`
@@ -167,18 +181,28 @@ The watcher automatically detects standard user folders on whatever drive or pat
 
 ## Privacy & Security
 
-- **Direct Connections Only**: Every API request and media upload connects directly from your PC to official Google Photos endpoints (`photoslibrary.googleapis.com` / Google Media Upload endpoints). No third-party servers or intermediaries exist.
-- **Local Credentials**: Authentication tokens are stored locally on your machine in `%APPDATA%\gotohp\` or inside your local directory.
-- **Git Protection**: The `.gitignore` file strictly excludes:
+- **Direct Connections Only**: Every API request and media upload connects directly from your machine to official Google Photos endpoints (`photoslibrary.googleapis.com`). No intermediate or third-party servers are involved.
+- **Local Credentials**: Authentication tokens and config files stay strictly on your local machine.
+- **Git Protection**: The `.gitignore` file excludes:
   - Database files (`gphotos.db`, `*.db`, `*.db-wal`, `*.db-shm`)
   - Personal config files and tokens (`gotohp.config`, `*.config`, `*.token`)
   - Log files and temporary cache
   Your personal file history and login tokens are **never** committed or pushed to Git.
-- **Zero Telemetry**: No tracking, metrics, analytics, or external calls are made.
+- **Zero Telemetry**: No tracking, analytics, or external telemetry of any kind.
+
+---
+
+## Troubleshooting & Issues
+
+If you encounter any bugs, unexpected behavior, or need help:
+- Run `./check_status.sh` (Linux) or `CheckStatus.bat` (Windows) to check queue and database status.
+- Run `./view_logs.sh` (Linux) or `ViewLogs.bat` (Windows) to inspect error details.
+- Please submit an issue on the GitHub repository:  
+  👉 **[Report an Issue on GitHub](https://github.com/shishir0x/GoogleUnlimited/issues)**
 
 ---
 
 ## License & Credits
 
 - Core Pixel upload engine powered by [`xob0t/gotohp`](https://github.com/xob0t/gotohp).
-- SQLite integration powered by `PSSQLite`.
+- Windows SQLite integration powered by `PSSQLite`.
