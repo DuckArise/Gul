@@ -969,6 +969,7 @@ invoke_upload() {
     fi
 }
 
+# shellcheck disable=SC2120
 do_watch() {
     init_db
 
@@ -1311,7 +1312,8 @@ show_help() {
 CMD="${1:-}"
 case "$CMD" in
     watch|--watch|run|--run)
-        do_watch
+        shift || true
+        do_watch "$@"
         ;;
     status|--status|-s)
         do_status
@@ -1348,6 +1350,7 @@ case "$CMD" in
         if [ -t 0 ]; then
             show_menu
         else
+            # shellcheck disable=SC2119
             do_watch
         fi
         ;;

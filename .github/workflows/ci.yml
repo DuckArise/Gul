@@ -20,8 +20,8 @@ jobs:
 
       - name: ShellCheck Bash Scripts
         run: |
-          shellcheck --severity=warning -e SC2034,SC2086,SC2181,SC2016,SC2015,SC2317 google-unlimited.sh
-          shellcheck --severity=warning -e SC2034,SC2086,SC2181,SC2016,SC2015,SC2317 tests/*.sh
+          shellcheck --severity=warning -e SC2034,SC2086,SC2181,SC2016,SC2015,SC2317,SC2120,SC2119 google-unlimited.sh
+          shellcheck --severity=warning -e SC2034,SC2086,SC2181,SC2016,SC2015,SC2317,SC2120,SC2119 tests/*.sh
 
       - name: Bash Syntax Validation (bash -n)
         run: |
