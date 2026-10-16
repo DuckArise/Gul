@@ -26,19 +26,6 @@ assert_output_contains() {
     fi
 }
 
-assert_exit_code() {
-    local name="$1"
-    local actual="$2"
-    local expected="$3"
-    if [ "$actual" -eq "$expected" ]; then
-        echo -e "  \033[0;32m[PASS]\033[0m $name (Exit code: $actual)"
-        PASSED=$((PASSED + 1))
-    else
-        echo -e "  \033[0;31m[FAIL]\033[0m $name (Expected exit code: $expected, got: $actual)"
-        FAILED=$((FAILED + 1))
-    fi
-}
-
 # 1. Missing token returns error
 OUT1="$(./google-unlimited.sh creds add - </dev/null 2>&1 || true)"
 assert_output_contains "Empty stdin to 'creds add -' outputs error" "$OUT1" "No OAuth token provided"
