@@ -16,7 +16,7 @@ OS="${OS:-$(uname -s)}"
 WATCH_FILE="$SCRIPT_DIR/watch_dirs.txt"
 # Folders used to seed watch_dirs.txt the first time it is created.
 # After that, watch_dirs.txt is the single source of truth.
-DEFAULT_WATCH_DIRS=("$HOME/Downloads" "$HOME/Pictures" "$HOME/Desktop" "$HOME/Documents" "$HOME/Music" "$HOME/Movies" "$HOME/Videos" "$HOME/Google Drive" "$HOME/Google Photos" "$HOME/OneDrive/Pictures" "$HOME/Pictures/iCloud Photos/Photos")
+DEFAULT_WATCH_DIRS=("$HOME/Pictures" "$HOME/Movies" "$HOME/Videos" "$HOME/Google Drive" "$HOME/Google Photos" "$HOME/OneDrive/Pictures" "$HOME/Pictures/iCloud Photos/Photos")
 
 # Terminal Colors
 CYAN='\033[0;36m'
