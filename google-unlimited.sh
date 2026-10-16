@@ -13,6 +13,10 @@ PID_FILE="$SCRIPT_DIR/.watcher.pid"
 SERVICE_NAME="google-unlimited.service"
 USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
 OS="${OS:-$(uname -s)}"
+WATCH_FILE="$SCRIPT_DIR/watch_dirs.txt"
+# Folders used to seed watch_dirs.txt the first time it is created.
+# After that, watch_dirs.txt is the single source of truth.
+DEFAULT_WATCH_DIRS=("$HOME/Downloads" "$HOME/Pictures" "$HOME/Desktop" "$HOME/Documents" "$HOME/Music" "$HOME/Movies" "$HOME/Videos" "$HOME/Google Drive" "$HOME/Google Photos" "$HOME/OneDrive/Pictures" "$HOME/Pictures/iCloud Photos/Photos")
 
 # Terminal Colors
 CYAN='\033[0;36m'
@@ -1028,24 +1032,16 @@ do_watch() {
         fi
     done
 
-    # 2. Custom directories from watch_dirs.txt
-    if [ -f "$SCRIPT_DIR/watch_dirs.txt" ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-            [ -z "$line" ] && continue
-            case "$line" in \#*) continue ;; esac
-            if [ -d "$line" ]; then
-                watch_dirs+=("$(cd "$line" && pwd)")
-            fi
-        done < "$SCRIPT_DIR/watch_dirs.txt"
-    fi
-
-    # 3. Standard user folders & cloud sync folders
-    for folder in "$HOME/Downloads" "$HOME/Pictures" "$HOME/Desktop" "$HOME/Documents" "$HOME/Music" "$HOME/Movies" "$HOME/Videos" "$HOME/Google Drive" "$HOME/Google Photos" "$HOME/OneDrive/Pictures" "$HOME/Pictures/iCloud Photos/Photos"; do
-        if [ -d "$folder" ]; then
-            watch_dirs+=("$folder")
+    # 2. Folders from watch_dirs.txt (seeded with the standard folders on first run;
+    #    manage with: ./google-unlimited.sh dirs add|remove|list)
+    seed_watch_file
+    while IFS= read -r line; do
+        if [ -d "$line" ]; then
+            watch_dirs+=("$(cd "$line" && pwd)")
+        else
+            echo -e "${YELLOW}  [WARN] Watched folder not found, skipping: $line${NC}"
         fi
-    done
+    done < <(read_watch_file)
 
     # Deduplicate watched folders
     local unique_dirs=()
@@ -1059,8 +1055,10 @@ do_watch() {
     watch_dirs=("${unique_dirs[@]}")
 
     if [ ${#watch_dirs[@]} -eq 0 ]; then
-        mkdir -p "$HOME/Pictures"
-        watch_dirs=("$HOME/Pictures")
+        echo -e "${YELLOW}No folders are being watched. Add one with:${NC}"
+        echo "  ./google-unlimited.sh dirs add ~/Pictures"
+        # exit 0 so systemd (Restart=on-failure) doesn't restart-loop
+        exit 0
     fi
 
     echo ""
@@ -1203,6 +1201,176 @@ do_watch() {
 }
 
 # ---------------------------------------------------------------------
+# ACTION: MANAGE WATCHED FOLDERS (watch_dirs.txt)
+# ---------------------------------------------------------------------
+seed_watch_file() {
+    [ -f "$WATCH_FILE" ] && return 0
+    {
+        echo "# GoogleUnlimited watched folders - one absolute path per line."
+        echo "# Lines starting with # are ignored."
+        echo "# Manage with: ./google-unlimited.sh dirs [list|add|remove|edit|reset]"
+        local f
+        for f in "${DEFAULT_WATCH_DIRS[@]}"; do
+            [ -d "$f" ] && echo "$f"
+        done
+    } > "$WATCH_FILE"
+}
+
+# Print the active (non-comment, non-blank, trimmed) entries of watch_dirs.txt
+read_watch_file() {
+    [ -f "$WATCH_FILE" ] || return 0
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -z "$line" ] && continue
+        case "$line" in \#*) continue ;; esac
+        echo "$line"
+    done < "$WATCH_FILE"
+}
+
+# Expand ~ and return an absolute path without a trailing slash
+normalize_dir() {
+    local p="$1"
+    case "$p" in "~") p="$HOME" ;; "~/"*) p="$HOME/${p#\~/}" ;; esac
+    if [ -d "$p" ]; then
+        (cd "$p" && pwd)
+    else
+        case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+        [ "$p" != "/" ] && p="${p%/}"
+        echo "$p"
+    fi
+}
+
+notify_watcher_restart() {
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        systemctl --user restart "$SERVICE_NAME" 2>/dev/null \
+            && echo -e "${GREEN}[OK] Restarted background service so the change takes effect.${NC}" \
+            || echo -e "${YELLOW}Run: systemctl --user restart $SERVICE_NAME${NC}"
+    elif [ "$OS" = "Darwin" ] && launchctl list 2>/dev/null | grep -q com.googleunlimited.watcher; then
+        launchctl stop com.googleunlimited.watcher 2>/dev/null || true   # KeepAlive restarts it
+        echo -e "${GREEN}[OK] Restarted background watcher so the change takes effect.${NC}"
+    elif [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+        echo -e "${YELLOW}A watcher is running - restart it (Ctrl+C, then 'watch') to apply the change.${NC}"
+    fi
+}
+
+dirs_list() {
+    local i=0 d
+    echo -e "${CYAN}Watched folders${NC} ${GRAY}($WATCH_FILE)${NC}"
+    while IFS= read -r d; do
+        i=$((i + 1))
+        if [ -d "$d" ]; then
+            echo -e "  [$i] $d"
+        else
+            echo -e "  [$i] $d ${YELLOW}(missing)${NC}"
+        fi
+    done < <(read_watch_file)
+    [ "$i" -eq 0 ] && echo -e "  ${GRAY}(none)${NC}"
+    return 0
+}
+
+dirs_add() {
+    [ $# -eq 0 ] && { echo "Usage: ./google-unlimited.sh dirs add <folder> [folder...]" >&2; return 1; }
+    local changed=0 arg d existing
+    for arg in "$@"; do
+        d="$(normalize_dir "$arg")"
+        if [ ! -d "$d" ]; then
+            echo -e "${RED}[ERROR] Not a folder: $arg${NC}" >&2
+            continue
+        fi
+        if read_watch_file | grep -Fxq -- "$d"; then
+            echo -e "${GRAY}Already watched: $d${NC}"
+            continue
+        fi
+        while IFS= read -r existing; do
+            case "$d/" in "${existing%/}/"*)
+                echo -e "${YELLOW}[NOTE] $d is inside $existing, which is already watched recursively.${NC}" ;;
+            esac
+        done < <(read_watch_file)
+        echo "$d" >> "$WATCH_FILE"
+        echo -e "${GREEN}[OK] Added: $d${NC}"
+        changed=1
+    done
+    [ "$changed" -eq 1 ] && notify_watcher_restart
+    return 0
+}
+
+# Accepts folder paths or the [numbers] shown by 'dirs list'
+dirs_remove() {
+    [ $# -eq 0 ] && { echo "Usage: ./google-unlimited.sh dirs remove <folder|number> [...]" >&2; return 1; }
+    local entries=() targets=() arg e
+    while IFS= read -r e; do entries+=("$e"); done < <(read_watch_file)
+
+    for arg in "$@"; do
+        if [[ "$arg" =~ ^[0-9]+$ ]] && [ "$arg" -ge 1 ] && [ "$arg" -le ${#entries[@]} ]; then
+            targets+=("${entries[$((arg - 1))]}")
+        else
+            targets+=("$(normalize_dir "$arg")")
+        fi
+    done
+
+    local tmp="$WATCH_FILE.tmp" line trimmed t drop removed=()
+    : > "$tmp"
+    while IFS= read -r line || [ -n "$line" ]; do
+        trimmed="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        drop=0
+        for t in "${targets[@]}"; do
+            [ "$trimmed" = "$t" ] && drop=1 && removed+=("$t") && break
+        done
+        [ "$drop" -eq 0 ] && printf '%s\n' "$line" >> "$tmp"
+    done < "$WATCH_FILE"
+    mv "$tmp" "$WATCH_FILE"
+
+    for t in "${targets[@]}"; do
+        if printf '%s\n' "${removed[@]+"${removed[@]}"}" | grep -Fxq -- "$t"; then
+            echo -e "${GREEN}[OK] Removed: $t${NC}"
+        else
+            echo -e "${YELLOW}Not in watch list: $t${NC}"
+        fi
+    done
+    [ ${#removed[@]} -gt 0 ] && notify_watcher_restart
+    return 0
+}
+
+do_dirs() {
+    local sub="${1:-list}"
+    shift || true
+    seed_watch_file
+    case "$sub" in
+        list|ls)          dirs_list ;;
+        add)              dirs_add "$@" ;;
+        remove|rm|del|delete) dirs_remove "$@" ;;
+        edit)
+            "${EDITOR:-${VISUAL:-nano}}" "$WATCH_FILE"
+            notify_watcher_restart ;;
+        reset)
+            rm -f "$WATCH_FILE"
+            seed_watch_file
+            echo -e "${GREEN}[OK] Reset to default folders.${NC}"
+            dirs_list
+            notify_watcher_restart ;;
+        *)
+            echo "Usage: ./google-unlimited.sh dirs [list|add <dir>...|remove <dir|number>...|edit|reset]" >&2
+            return 1 ;;
+    esac
+}
+
+dirs_menu() {
+    while true; do
+        echo ""
+        dirs_list
+        echo ""
+        read -rp "[a]dd  [r]emove  [e]dit file  [b]ack: " act
+        case "$act" in
+            a|A) read -rep "Folder to add: " p; [ -n "$p" ] && dirs_add "$p" ;;
+            r|R) read -rp "Number or path to remove: " p; [ -n "$p" ] && dirs_remove "$p" ;;
+            e|E) do_dirs edit ;;
+            *)   return 0 ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------
 # SECURE CREDENTIALS HANDLER (SEC-01)
 # ---------------------------------------------------------------------
 do_creds() {
@@ -1270,9 +1438,10 @@ show_menu() {
     echo "  [6] Disable Auto-Start on Boot"
     echo "  [7] Stop Background Watcher"
     echo "  [8] Verify Binary Integrity"
+    echo "  [9] Manage Watched Folders"
     echo "  [0] Exit"
     echo -e "${CYAN}==========================================================${NC}"
-    read -rp "Select an option [0-8, Default: 1]: " choice
+    read -rp "Select an option [0-9, Default: 1]: " choice
     choice="${choice:-1}"
 
     case "$choice" in
@@ -1284,6 +1453,7 @@ show_menu() {
         6) do_disable_startup ;;
         7) do_stop ;;
         8) do_verify ;;
+        9) seed_watch_file; dirs_menu ;;
         0) exit 0 ;;
         *) echo "Invalid option"; sleep 1; show_menu ;;
     esac
@@ -1302,6 +1472,9 @@ show_help() {
     echo "  stop              Stop running background watcher instances"
     echo "  verify            Verify gotohp-cli binary integrity using trusted SHA-256"
     echo "  creds             Manage credentials securely (creds add / creds list)"
+    echo "  dirs              Manage watched folders:"
+    echo "                      dirs list | dirs add <dir>... | dirs remove <dir|number>..."
+    echo "                      dirs edit  (open watch_dirs.txt in \$EDITOR) | dirs reset"
     echo "  menu              Open interactive terminal menu"
     echo "  help              Show this help message"
 }
@@ -1339,6 +1512,10 @@ case "$CMD" in
     creds)
         shift
         do_creds "$@"
+        ;;
+    dirs|--dirs|folders)
+        shift
+        do_dirs "$@"
         ;;
     menu|--menu)
         show_menu
