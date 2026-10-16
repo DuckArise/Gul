@@ -26,10 +26,13 @@ echo   [4] View Activity Logs
 echo   [5] Enable Auto-Start on Windows Boot
 echo   [6] Disable Auto-Start on Windows Boot
 echo   [7] Stop Background Watcher
+echo   [8] Manage Watched Folders (Add/List custom folders)
+echo   [9] Manage Google Accounts (List/Switch account)
+echo   [10] Force Re-scan & Sync All Media
 echo   [0] Exit
 echo ==========================================================
 set "choice="
-set /p "choice=Select an option [1-7, Default: 1]: "
+set /p "choice=Select an option [1-10, Default: 1]: "
 if "%choice%"=="" set "choice=1"
 if "%choice%"=="1" goto run_watcher
 if "%choice%"=="2" goto run_silent
@@ -38,6 +41,9 @@ if "%choice%"=="4" goto view_logs
 if "%choice%"=="5" goto enable_startup
 if "%choice%"=="6" goto disable_startup
 if "%choice%"=="7" goto stop_watcher
+if "%choice%"=="8" goto manage_folders
+if "%choice%"=="9" goto manage_account
+if "%choice%"=="10" goto force_resync
 if "%choice%"=="0" exit /b 0
 echo Invalid option.
 timeout /t 2 >nul
@@ -45,9 +51,9 @@ goto menu
 
 :handle_arg
 set "arg=%~1"
-if /i "%arg%"=="watch" goto run_watcher
-if /i "%arg%"=="run" goto run_watcher
-if /i "%arg%"=="1" goto run_watcher
+if /i "%arg%"=="watch" goto run_watcher_arg
+if /i "%arg%"=="run" goto run_watcher_arg
+if /i "%arg%"=="1" goto run_watcher_arg
 if /i "%arg%"=="silent" goto run_silent
 if /i "%arg%"=="bg" goto run_silent
 if /i "%arg%"=="2" goto run_silent
@@ -64,14 +70,28 @@ if /i "%arg%"=="disable-startup" goto disable_startup
 if /i "%arg%"=="6" goto disable_startup
 if /i "%arg%"=="stop" goto stop_watcher
 if /i "%arg%"=="7" goto stop_watcher
+if /i "%arg%"=="dirs" goto manage_folders
+if /i "%arg%"=="folders" goto manage_folders
+if /i "%arg%"=="8" goto manage_folders
+if /i "%arg%"=="account" goto manage_account
+if /i "%arg%"=="creds" goto manage_account
+if /i "%arg%"=="9" goto manage_account
+if /i "%arg%"=="resync" goto force_resync
+if /i "%arg%"=="force" goto force_resync
+if /i "%arg%"=="10" goto force_resync
 echo Unknown argument: %arg%
-echo Usage: GoogleUnlimited.bat [watch^|silent^|status^|logs^|enable^|disable^|stop]
+echo Usage: GoogleUnlimited.bat [watch^|silent^|status^|logs^|enable^|disable^|stop^|dirs^|account^|resync]
 exit /b 1
 
 :run_watcher
 if "%IS_MENU%"=="1" cls
 %PS_CMD% -File "%~dp0WatchAndUpload.ps1"
 if "%IS_MENU%"=="1" (pause & goto menu)
+exit /b %ERRORLEVEL%
+
+:run_watcher_arg
+shift
+%PS_CMD% -File "%~dp0WatchAndUpload.ps1" %*
 exit /b %ERRORLEVEL%
 
 :run_silent
@@ -109,5 +129,85 @@ exit /b %ERRORLEVEL%
 :stop_watcher
 if "%IS_MENU%"=="1" cls
 %PS_CMD% -Command "& { & '%~dp0WatchAndUpload.ps1' -StopWatcher }"
+if "%IS_MENU%"=="1" (pause & goto menu)
+exit /b %ERRORLEVEL%
+
+:manage_folders
+cls
+echo ==========================================================
+echo   *  Manage Watched Folders
+echo ==========================================================
+set "WATCH_CONF=%~dp0watch_dirs.txt"
+if exist "%WATCH_CONF%" (
+    echo Current custom watch folders in watch_dirs.txt:
+    type "%WATCH_CONF%"
+) else (
+    echo No custom folders configured yet (using standard user and cloud folders).
+)
+echo.
+echo Options:
+echo   [1] Add a custom folder path to watch
+echo   [2] Clear all custom folders
+echo   [0] Back to main menu
+echo ==========================================================
+set "fchoice="
+set /p "fchoice=Select an option [0-2]: "
+if "%fchoice%"=="1" (
+    echo.
+    set "newdir="
+    set /p "newdir=Enter full path of folder to watch: "
+    if not "%newdir%"=="" (
+        echo %newdir%>> "%WATCH_CONF%"
+        echo [OK] Added folder: %newdir%
+    )
+    timeout /t 2 >nul
+    goto manage_folders
+)
+if "%fchoice%"=="2" (
+    if exist "%WATCH_CONF%" del "%WATCH_CONF%"
+    echo [OK] Custom watch folders cleared.
+    timeout /t 2 >nul
+    goto manage_folders
+)
+goto menu
+
+:manage_account
+cls
+echo ==========================================================
+echo   *  Google Photos Account Management
+echo ==========================================================
+if exist "%~dp0gotohp-cli-x64.exe" (
+    "%~dp0gotohp-cli-x64.exe" --config "%~dp0gotohp.config" creds list
+) else (
+    echo gotohp-cli-x64.exe not found.
+)
+echo.
+echo Options:
+echo   [1] Switch active account
+echo   [2] Add account via GUI (gotohp-x64.exe)
+echo   [0] Back to main menu
+echo ==========================================================
+set "acchoice="
+set /p "acchoice=Select an option [0-2]: "
+if "%acchoice%"=="1" (
+    set "acemail="
+    set /p "acemail=Enter email address to set active: "
+    if not "%acemail%"=="" (
+        "%~dp0gotohp-cli-x64.exe" --config "%~dp0gotohp.config" creds set %acemail%
+    )
+    pause
+    goto manage_account
+)
+if "%acchoice%"=="2" (
+    if exist "%~dp0gotohp-x64.exe" start "" "%~dp0gotohp-x64.exe"
+    pause
+    goto manage_account
+)
+goto menu
+
+:force_resync
+if "%IS_MENU%"=="1" cls
+echo Starting full scan & force re-sync of all media...
+%PS_CMD% -File "%~dp0WatchAndUpload.ps1" -ForceResync
 if "%IS_MENU%"=="1" (pause & goto menu)
 exit /b %ERRORLEVEL%

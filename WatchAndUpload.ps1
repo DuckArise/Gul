@@ -4,6 +4,9 @@
 #  Zero hardcoded paths - Self-contained SQLite engine
 # =====================================================================
 param(
+    [string[]]$WatchDirs = @(),
+    [string]$Account = "",
+    [switch]$ForceResync,
     [switch]$StatusOnly,
     [switch]$ShowLogs,
     [switch]$EnableStartup,
@@ -84,12 +87,45 @@ $folderCandidates = @(
     [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop),
     [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments),
     [Environment]::GetFolderPath([Environment+SpecialFolder]::MyMusic),
+    [Environment]::GetFolderPath([Environment+SpecialFolder]::MyVideos),
     (Join-Path $userHome "Downloads"),
     (Join-Path $userHome "Pictures"),
     (Join-Path $userHome "Desktop"),
     (Join-Path $userHome "Documents"),
-    (Join-Path $userHome "Music")
+    (Join-Path $userHome "Music"),
+    (Join-Path $userHome "Videos"),
+    (Join-Path $userHome "OneDrive\Pictures"),
+    (Join-Path $userHome "OneDrive\Pictures\Camera Roll"),
+    (Join-Path $userHome "Pictures\iCloud Photos\Photos"),
+    (Join-Path $userHome "Google Drive"),
+    (Join-Path $userHome "Google Photos"),
+    "G:\",
+    "G:\My Drive",
+    "G:\Other computers"
 )
+
+# Load custom watch directories from watch_dirs.txt if present
+$customDirsFile = Join-Path $script:BASE "watch_dirs.txt"
+if ([System.IO.File]::Exists($customDirsFile)) {
+    try {
+        $lines = [System.IO.File]::ReadAllLines($customDirsFile)
+        foreach ($line in $lines) {
+            $trimmed = $line.Trim()
+            if ($trimmed -and -not $trimmed.StartsWith("#")) {
+                $folderCandidates += $trimmed
+            }
+        }
+    } catch {}
+}
+
+# Add CLI specified directories
+if ($WatchDirs -and $WatchDirs.Count -gt 0) {
+    foreach ($wd in $WatchDirs) {
+        if (-not [string]::IsNullOrWhiteSpace($wd)) {
+            $folderCandidates += $wd
+        }
+    }
+}
 
 $seenFolders = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 $script:WATCH_DIRS = New-Object 'System.Collections.Generic.List[string]'
@@ -102,10 +138,16 @@ foreach ($cand in $folderCandidates) {
     }
 }
 
-# -- Supported extensions ----------------------------------------------
+# -- Supported extensions (Photos, RAW camera images, and Videos) -------
 $script:EXT = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-$extList = @(".jpg", ".jpeg", ".png", ".heic", ".webp", ".gif",
-             ".mp4", ".mov", ".mkv", ".avi", ".dng")
+$extList = @(
+    # Standard Photos & Images
+    ".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif", ".bmp", ".tiff", ".tif", ".svg", ".ico", ".jfif", ".avif",
+    # Camera RAW Formats
+    ".dng", ".raw", ".cr2", ".cr3", ".nef", ".arw", ".orf", ".rw2", ".pef", ".srw", ".raf",
+    # Video Formats
+    ".mp4", ".mov", ".mkv", ".avi", ".m4v", ".3gp", ".3g2", ".wmv", ".webm", ".mpg", ".mpeg", ".mts", ".m2ts", ".ts", ".flv", ".vob"
+)
 foreach ($e in $extList) { $script:EXT.Add($e) | Out-Null }
 
 $script:MIN_BYTES = 10240   # 10 KB minimum file size
@@ -433,47 +475,61 @@ function Wait-ForFileReady([string]$path) {
 }
 
 # ---------------------------------------------------------------------
+# DEDUPLICATION CHECKER (Hash-verified to eliminate collisions)
+# ---------------------------------------------------------------------
+function Test-IsDuplicateUpload([string]$filePath) {
+    if ($script:history.Contains($filePath)) { return $true }
+
+    $fi = New-Object System.IO.FileInfo($filePath)
+    if (-not $fi.Exists) { return $false }
+    $name = $fi.Name
+    $len = $fi.Length
+    $lookupKey = "$name|$len"
+
+    if (-not $script:fileLookup.Contains($lookupKey)) {
+        return $false
+    }
+
+    # File with identical name and size exists in database. Check hash to avoid false collisions.
+    $candidateHash = Get-FileHashSafe $filePath
+    $existing = Invoke-SqliteQuery -DataSource $script:DB `
+        -Query "SELECT content_hash FROM uploads WHERE file_name = @fn AND file_size = @fs AND file_size > 0 LIMIT 1" `
+        -SqlParameters @{ fn = $name; fs = $len } -ErrorAction SilentlyContinue
+
+    $isDuplicate = $false
+    if ($existing -and $existing.content_hash) {
+        if ($existing.content_hash -eq $candidateHash) {
+            $isDuplicate = $true
+        }
+    } elseif ($existing) {
+        # Legacy entry without hash: backfill hash and treat as duplicate
+        $isDuplicate = $true
+        if ($candidateHash) {
+            Invoke-SqliteQuery -DataSource $script:DB `
+                -Query "UPDATE uploads SET content_hash = @h WHERE file_name = @fn AND file_size = @fs AND content_hash IS NULL" `
+                -SqlParameters @{ h = $candidateHash; fn = $name; fs = $len } -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+
+    if ($isDuplicate) {
+        Save-Upload $filePath "DUAL_BOOT_SYNC" $name $len $candidateHash | Out-Null
+        return $true
+    }
+    return $false
+}
+
+# ---------------------------------------------------------------------
 # CORE UPLOAD FUNCTION WITH DYNAMIC IN-PLACE PROGRESS BAR
 # ---------------------------------------------------------------------
 function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
     if ($path.Contains("\Modules\")) { return }
     $ext = [System.IO.Path]::GetExtension($path).ToLower()
     if (-not $script:EXT.Contains($ext)) { return }
-    if ($script:history.Contains($path)) { return }
+    if (-not $ForceResync -and (Test-IsDuplicateUpload $path)) { return }
 
     $name = [System.IO.Path]::GetFileName($path)
     $fileInfo = New-Object System.IO.FileInfo($path)
     if (-not $fileInfo.Exists) { return }
-
-    # Dual-boot cross-platform deduplication check (avoids duplicate uploads across OSes)
-    $lookupKey = "$name|$($fileInfo.Length)"
-    if ($script:fileLookup.Contains($lookupKey)) {
-        # File with identical name and size exists in database. Check hash to avoid false collisions.
-        $candidateHash = Get-FileHashSafe $path
-        $existing = Invoke-SqliteQuery -DataSource $script:DB `
-            -Query "SELECT content_hash FROM uploads WHERE file_name = @fn AND file_size = @fs AND file_size > 0 LIMIT 1" `
-            -SqlParameters @{ fn = $name; fs = $fileInfo.Length } -ErrorAction SilentlyContinue
-        
-        $isDuplicate = $false
-        if ($existing -and $existing.content_hash) {
-            if ($existing.content_hash -eq $candidateHash) {
-                $isDuplicate = $true
-            }
-        } elseif ($existing) {
-            # Legacy entry without hash: backfill hash and treat as duplicate
-            $isDuplicate = $true
-            if ($candidateHash) {
-                Invoke-SqliteQuery -DataSource $script:DB `
-                    -Query "UPDATE uploads SET content_hash = @h WHERE file_name = @fn AND file_size = @fs AND content_hash IS NULL" `
-                    -SqlParameters @{ h = $candidateHash; fn = $name; fs = $fileInfo.Length } -ErrorAction SilentlyContinue | Out-Null
-            }
-        }
-
-        if ($isDuplicate) {
-            Save-Upload $path "DUAL_BOOT_SYNC" $name $fileInfo.Length $candidateHash | Out-Null
-            return
-        }
-    }
 
     if (-not $script:inFlight.Add($path)) { return }
 
@@ -511,7 +567,14 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
         if ($script:CONFIG_ARGS.Count -gt 0) {
             $uploadArgs += $script:CONFIG_ARGS
         }
-        $uploadArgs += @("upload", $path)
+        $uploadArgs += @("upload", "--no-tui")
+        if ($Account) {
+            $uploadArgs += @("--account", $Account)
+        }
+        if ($ForceResync) {
+            $uploadArgs += @("--force")
+        }
+        $uploadArgs += @($path)
 
         # Support ArgumentList (.NET Core / PS 7) or robustly escaped argument string (PS 5.1)
         if ($psi.PSObject.Properties['ArgumentList']) {
@@ -570,11 +633,29 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
         $totalTime = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
         $doneBar = "#" * $barWidth
 
-        if ($exitCode -eq 0) {
-            $mediaKey = ""
+        # Parse JSON output for success status and diagnostics
+        $isSuccess = ($exitCode -eq 0)
+        $mediaKey = ""
+        $cliErr = ""
+
+        if ($stdout) {
+            if ($stdout -match '"success":\s*true') {
+                $isSuccess = $true
+            }
             if ($stdout -match '"mediaKey":\s*"([^"]+)"') {
                 $mediaKey = $matches[1]
             }
+            if ($stdout -match '"error":\s*"([^"]+)"') {
+                $cliErr = $matches[1]
+            } elseif ($stdout -match '"message":\s*"([^"]+)"') {
+                $cliErr = $matches[1]
+            }
+        }
+        if (-not $cliErr -and $stderr) {
+            $cliErr = $stderr.Trim()
+        }
+
+        if ($isSuccess) {
             $contentHash = Get-FileHashSafe $path
             Safe-ConsoleWrite("`r  [$doneBar] 100% [OK] Uploaded in $($totalTime)s: $name ($sizeLabel)        `n")
             Write-Log "SUCCESS | $name ($sizeLabel in $($totalTime)s)" "OK"
@@ -585,8 +666,8 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
                 Write-Log "TIMEOUT | Upload exceeded ${timeoutSeconds}s threshold: $name" "ERROR"
             } else {
                 Safe-ConsoleWrite("`r  [--------------------] FAILED in $($totalTime)s: $name                      `n")
-                if ($stderr -and -not $stdout) {
-                    Write-Log "CLI stderr for ${name}: $stderr" "WARN"
+                if ($cliErr) {
+                    Write-Log "CLI error for ${name}: $cliErr" "WARN"
                 }
             }
 
@@ -599,7 +680,8 @@ function Invoke-Upload([string]$path, [int]$current = 1, [int]$total = 1) {
                 Write-Log "GAVE UP after $attempts upload attempts: $name" "ERROR"
                 Remove-Retry $path
             } else {
-                Write-Log "FAILED upload (attempt $attempts/$($script:MAX_RETRY)) - queued for retry: $name" "WARN"
+                $errSuffix = if ($cliErr) { " ($cliErr)" } else { "" }
+                Write-Log "FAILED upload$errSuffix (attempt $attempts/$($script:MAX_RETRY)) - queued for retry: $name" "WARN"
                 Save-Retry $path $attempts
             }
         }
@@ -686,9 +768,25 @@ $checkArgs = @()
 if ($script:CONFIG_ARGS.Count -gt 0) {
     $checkArgs += $script:CONFIG_ARGS
 }
-$checkArgs += @("creds", "list")
 
-$credsOutput = & $script:GOTOHP $checkArgs 2>&1 | Out-String
+if ($Account) {
+    Write-Host "Setting active Google Photos account to: $Account" -ForegroundColor Cyan
+    & $script:GOTOHP $checkArgs creds set $Account 2>&1 | Out-Null
+}
+
+$listArgs = $checkArgs + @("creds", "list")
+$credsOutput = & $script:GOTOHP $listArgs 2>&1 | Out-String
+
+# Auto-recovery: If credentials exist but none has '*', activate the first available account
+if ($credsOutput -notmatch "No credentials found" -and $credsOutput -notmatch "\*") {
+    if ($credsOutput -match '(?m)^\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})') {
+        $firstAcc = $matches[1]
+        Write-Host "  [Auto-Recovery] Activating Google Photos account: $firstAcc" -ForegroundColor Yellow
+        & $script:GOTOHP $checkArgs creds set $firstAcc 2>&1 | Out-Null
+        $credsOutput = & $script:GOTOHP $listArgs 2>&1 | Out-String
+    }
+}
+
 if ($credsOutput -match "No credentials found" -or ($credsOutput -notmatch "\*")) {
     Write-Host ""
     Write-Host "==========================================================" -ForegroundColor Red
@@ -701,6 +799,10 @@ if ($credsOutput -match "No credentials found" -or ($credsOutput -notmatch "\*")
     Write-Host ""
     if (-not $StatusOnly) {
         exit 1
+    }
+} else {
+    if ($credsOutput -match '\*\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})') {
+        Write-Host "  Active Account: $($matches[1])" -ForegroundColor Green
     }
 }
 
@@ -782,8 +884,7 @@ foreach ($dir in $script:WATCH_DIRS) {
             Where-Object {
                 $script:EXT.Contains($_.Extension.ToLower()) -and
                 -not $_.FullName.Contains("\Modules\") -and
-                -not $script:history.Contains($_.FullName) -and
-                -not $script:fileLookup.Contains("$($_.Name)|$($_.Length)")
+                ($ForceResync -or (-not (Test-IsDuplicateUpload $_.FullName)))
             } | ForEach-Object { $unrecorded.Add($_) }
     } catch {
         Write-Log "Scan error in $dir - $_" "WARN"
@@ -793,7 +894,7 @@ foreach ($dir in $script:WATCH_DIRS) {
 # Include pending retry queue files
 foreach ($qf in @($script:retryMap.Keys)) {
     $fi = New-Object System.IO.FileInfo($qf)
-    if ($fi.Exists -and -not $script:history.Contains($qf)) {
+    if ($fi.Exists -and ($ForceResync -or (-not (Test-IsDuplicateUpload $qf)))) {
         $unrecorded.Add($fi)
     }
 }
@@ -822,7 +923,30 @@ Write-Host "[Phase 2] Real-time watcher active." -ForegroundColor Yellow
 Write-Host "  Waiting for new downloads... Press Ctrl+C to stop." -ForegroundColor DarkGray
 Write-Host ""
 
-$action = { Invoke-Upload $Event.SourceEventArgs.FullPath 1 1 }
+$script:recentEvents = New-Object 'System.Collections.Generic.Dictionary[string,DateTime]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+$action = {
+    $evPath = $Event.SourceEventArgs.FullPath
+    if (-not $evPath) { return }
+
+    # Debounce duplicate filesystem events within 1.5 seconds
+    $now = [DateTime]::Now
+    $shouldProcess = $false
+    if ($script:recentEvents.ContainsKey($evPath)) {
+        $diff = ($now - $script:recentEvents[$evPath]).TotalSeconds
+        if ($diff -ge 1.5) {
+            $script:recentEvents[$evPath] = $now
+            $shouldProcess = $true
+        }
+    } else {
+        $script:recentEvents[$evPath] = $now
+        $shouldProcess = $true
+    }
+
+    if ($shouldProcess) {
+        Invoke-Upload $evPath 1 1
+    }
+}
 
 $script:watchers = New-Object 'System.Collections.Generic.List[System.IO.FileSystemWatcher]'
 
@@ -832,12 +956,13 @@ foreach ($dir in $script:WATCH_DIRS) {
         $w.Path                  = $dir
         $w.IncludeSubdirectories = $true
         $w.InternalBufferSize    = 65536
-        $w.NotifyFilter          = [System.IO.NotifyFilters]::FileName -bor [System.IO.NotifyFilters]::LastWrite
+        $w.NotifyFilter          = [System.IO.NotifyFilters]::FileName -bor [System.IO.NotifyFilters]::LastWrite -bor [System.IO.NotifyFilters]::Size
 
         Register-ObjectEvent $w 'Error' -Action {
             Write-Log "FSW buffer overflow on $($Event.Sender.Path)" "WARN"
         } | Out-Null
         Register-ObjectEvent $w 'Created' -Action $action | Out-Null
+        Register-ObjectEvent $w 'Changed' -Action $action | Out-Null
         Register-ObjectEvent $w 'Renamed' -Action $action | Out-Null
 
         $w.EnableRaisingEvents = $true
@@ -865,10 +990,8 @@ try {
                         Where-Object {
                             $script:EXT.Contains($_.Extension.ToLower()) -and
                             -not $_.FullName.Contains("\Modules\") -and
-                            -not $script:history.Contains($_.FullName) -and
-                            -not $script:fileLookup.Contains("$($_.Name)|$($_.Length)") -and
                             -not $script:inFlight.Contains($_.FullName) -and
-                            $_.LastWriteTime -gt ([DateTime]::Now.AddMinutes(-10))
+                            ($ForceResync -or (-not (Test-IsDuplicateUpload $_.FullName)))
                         } | ForEach-Object {
                             Write-Log "Sweep caught missed file: $($_.Name)" "WARN"
                             Invoke-Upload $_.FullName 1 1

@@ -928,13 +928,20 @@ invoke_upload() {
     local start_time
     start_time=$(date +%s)
     local output
-    output="$(run_gotohp upload "$fpath" 2>&1)"
+    output="$(run_gotohp upload --no-tui "$fpath" 2>&1)"
     local exit_code=$?
     local end_time
     end_time=$(date +%s)
     local duration=$((end_time - start_time))
 
+    local is_success=0
     if [ $exit_code -eq 0 ]; then
+        is_success=1
+    elif echo "$output" | grep -q '"success": *true'; then
+        is_success=1
+    fi
+
+    if [ $is_success -eq 1 ]; then
         local mkey
         mkey="$(echo "$output" | grep -o '"mediaKey": *"[^"]*"' | head -n1 | cut -d'"' -f4 || echo "")"
         echo "  [####################] 100% [OK] Uploaded in ${duration}s: $fname (${size_mb} MB)"
@@ -942,15 +949,21 @@ invoke_upload() {
         save_upload "$fpath" "$mkey" "$fname" "$size_bytes"
     else
         echo "  [--------------------] FAILED in ${duration}s: $fname"
+        local err_msg
+        err_msg="$(echo "$output" | grep -o '"error": *"[^"]*"' | head -n1 | cut -d'"' -f4 || echo "")"
+        [ -z "$err_msg" ] && err_msg="$(echo "$output" | grep -o '"message": *"[^"]*"' | head -n1 | cut -d'"' -f4 || echo "")"
+        local err_suffix=""
+        [ -n "$err_msg" ] && err_suffix=" ($err_msg)"
+
         local attempts
         attempts=$(sqlite3 "$DB" "SELECT attempts FROM retry_queue WHERE path = '$escaped_path';" 2>/dev/null || echo 0)
         [ -z "$attempts" ] && attempts=0
         attempts=$((attempts + 1))
         if [ "$attempts" -ge 3 ]; then
-            write_log "GAVE UP after $attempts upload attempts: $fname" "ERROR"
+            write_log "GAVE UP after $attempts upload attempts: $fname$err_suffix" "ERROR"
             remove_retry "$fpath"
         else
-            write_log "FAILED upload (attempt $attempts/3) - queued for retry: $fname" "WARN"
+            write_log "FAILED upload$err_suffix (attempt $attempts/3) - queued for retry: $fname" "WARN"
             save_retry "$fpath" "$attempts"
         fi
     fi
@@ -963,6 +976,17 @@ do_watch() {
     local creds_check
     creds_check="$(run_gotohp creds list 2>&1 || true)"
     if ! echo "$creds_check" | grep -q "\*"; then
+        # Auto-recovery: If credentials exist but none has '*', activate the first available account
+        local first_acc
+        first_acc="$(echo "$creds_check" | grep -E -o '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | head -n1 || echo "")"
+        if [ -n "$first_acc" ]; then
+            echo -e "${YELLOW}  [Auto-Recovery] Activating Google Photos account: $first_acc${NC}"
+            run_gotohp creds set "$first_acc" >/dev/null 2>&1 || true
+            creds_check="$(run_gotohp creds list 2>&1 || true)"
+        fi
+    fi
+
+    if ! echo "$creds_check" | grep -q "\*"; then
         echo ""
         echo -e "${RED}==========================================================${NC}"
         echo -e "${YELLOW}  ACTION REQUIRED: No Google Account Logged In!${NC}"
@@ -971,6 +995,10 @@ do_watch() {
         echo "    ./google-unlimited.sh creds add \"<oauth_token>\""
         echo -e "${RED}==========================================================${NC}"
         exit 1
+    else
+        local active_acc
+        active_acc="$(echo "$creds_check" | grep '\*' | grep -E -o '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | head -n1 || echo "")"
+        [ -n "$active_acc" ] && echo -e "  ${GREEN}Active Account: $active_acc${NC}"
     fi
 
     # Check watcher dependency
@@ -991,11 +1019,43 @@ do_watch() {
 
     # Discover watched folders
     local watch_dirs=()
-    for folder in "$HOME/Downloads" "$HOME/Pictures" "$HOME/Desktop" "$HOME/Documents" "$HOME/Music" "$HOME/Movies" "$HOME/Videos"; do
+
+    # 1. Custom directories passed via CLI arguments
+    for custom_arg in "$@"; do
+        if [ -d "$custom_arg" ]; then
+            watch_dirs+=("$(cd "$custom_arg" && pwd)")
+        fi
+    done
+
+    # 2. Custom directories from watch_dirs.txt
+    if [ -f "$SCRIPT_DIR/watch_dirs.txt" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            if [ -d "$line" ]; then
+                watch_dirs+=("$(cd "$line" && pwd)")
+            fi
+        done < "$SCRIPT_DIR/watch_dirs.txt"
+    fi
+
+    # 3. Standard user folders & cloud sync folders
+    for folder in "$HOME/Downloads" "$HOME/Pictures" "$HOME/Desktop" "$HOME/Documents" "$HOME/Music" "$HOME/Movies" "$HOME/Videos" "$HOME/Google Drive" "$HOME/Google Photos" "$HOME/OneDrive/Pictures" "$HOME/Pictures/iCloud Photos/Photos"; do
         if [ -d "$folder" ]; then
             watch_dirs+=("$folder")
         fi
     done
+
+    # Deduplicate watched folders
+    local unique_dirs=()
+    for d in "${watch_dirs[@]}"; do
+        local seen=0
+        for u in "${unique_dirs[@]}"; do
+            [ "$u" = "$d" ] && seen=1 && break
+        done
+        [ $seen -eq 0 ] && unique_dirs+=("$d")
+    done
+    watch_dirs=("${unique_dirs[@]}")
 
     if [ ${#watch_dirs[@]} -eq 0 ]; then
         mkdir -p "$HOME/Pictures"
@@ -1016,7 +1076,7 @@ do_watch() {
 
     # Phase 1: Startup Scan
     echo -e "${CYAN}[Phase 1] Scanning for unrecorded files...${NC}"
-    local valid_ext="^(jpg|jpeg|png|heic|webp|gif|mp4|mov|mkv|avi|dng)$"
+    local valid_ext="^(jpg|jpeg|png|heic|heif|webp|gif|bmp|tiff|tif|svg|ico|jfif|avif|dng|raw|cr2|cr3|nef|arw|orf|rw2|pef|srw|raf|mp4|mov|mkv|avi|m4v|3gp|3g2|wmv|webm|mpg|mpeg|mts|m2ts|ts|flv|vob)$"
     local file_count=0
     while IFS= read -r -d '' file; do
         local ext="${file##*.}"
@@ -1038,6 +1098,7 @@ do_watch() {
     retry_list=$(sqlite3 "$DB" "SELECT path FROM retry_queue WHERE attempts < 3;" 2>/dev/null || true)
     if [ -n "$retry_list" ]; then
         while IFS= read -r rfile; do
+            [ -z "$rfile" ] && continue
             if [ -f "$rfile" ]; then
                 local rfname
                 rfname="$(basename "$rfile")"
@@ -1099,7 +1160,45 @@ do_watch() {
     }
     trap cleanup SIGINT SIGTERM EXIT
 
-    wait "$watcher_pid" 2>/dev/null || true
+    # Phase 2 Periodic Sweep: safety sweep & retry queue processor every 30s
+    while kill -0 "$watcher_pid" 2>/dev/null; do
+        sleep 30
+        # Safety sweep for missed files
+        while IFS= read -r -d '' file; do
+            local ext="${file##*.}"
+            ext="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
+            if echo "$ext" | grep -qE "$valid_ext"; then
+                local fname
+                fname="$(basename "$file")"
+                local size_bytes
+                size_bytes=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+                if ! is_uploaded "$file" "$fname" "$size_bytes"; then
+                    write_log "Sweep caught missed file: $fname" "WARN"
+                    invoke_upload "$file"
+                fi
+            fi
+        done < <(find "${watch_dirs[@]}" -type f -print0 2>/dev/null)
+
+        # Flush retry queue
+        local retry_sweep
+        retry_sweep=$(sqlite3 "$DB" "SELECT path FROM retry_queue WHERE attempts < 3;" 2>/dev/null || true)
+        if [ -n "$retry_sweep" ]; then
+            while IFS= read -r rfile; do
+                [ -z "$rfile" ] && continue
+                if [ -f "$rfile" ]; then
+                    local rfname
+                    rfname="$(basename "$rfile")"
+                    local rsize_bytes
+                    rsize_bytes=$(stat -c%s "$rfile" 2>/dev/null || stat -f%z "$rfile" 2>/dev/null || echo 0)
+                    if ! is_uploaded "$rfile" "$rfname" "$rsize_bytes"; then
+                        invoke_upload "$rfile"
+                    fi
+                else
+                    remove_retry "$rfile"
+                fi
+            done <<< "$retry_sweep"
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------

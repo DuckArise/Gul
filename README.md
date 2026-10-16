@@ -91,19 +91,25 @@ Double-click **`GoogleUnlimited.bat`** to open the interactive manager:
   [5] Enable Auto-Start on Windows Boot
   [6] Disable Auto-Start on Windows Boot
   [7] Stop Background Watcher
+  [8] Manage Watched Folders (Custom dirs / watch_dirs.txt)
+  [9] Manage Google Accounts (Switch or add accounts)
+  [10] Force Re-scan & Sync All Media (Safety sweep)
   [0] Exit
 ==========================================================
 ```
 
 You can also run any action directly from the terminal or shortcuts:
 ```cmd
-GoogleUnlimited.bat watch     # Live terminal watcher with progress bar
-GoogleUnlimited.bat silent    # Silent background run (zero window)
-GoogleUnlimited.bat status    # Check total uploads and retry queue
-GoogleUnlimited.bat logs      # View last 30 sync activity logs
-GoogleUnlimited.bat enable    # Enable auto-start on Windows boot
-GoogleUnlimited.bat disable   # Disable auto-start on Windows boot
-GoogleUnlimited.bat stop      # Stop any running background watcher
+GoogleUnlimited.bat watch                 # Live terminal watcher with progress bar
+GoogleUnlimited.bat silent                # Silent background run (zero window)
+GoogleUnlimited.bat status                # Check total uploads and retry queue
+GoogleUnlimited.bat logs                  # View last 30 sync activity logs
+GoogleUnlimited.bat dirs                  # Open and manage custom watch folders
+GoogleUnlimited.bat account               # View or switch active Google account
+GoogleUnlimited.bat resync                # Force re-scan and sync all existing media
+GoogleUnlimited.bat enable                # Enable auto-start on Windows boot
+GoogleUnlimited.bat disable               # Disable auto-start on Windows boot
+GoogleUnlimited.bat stop                  # Stop any running background watcher
 ```
 
 ---
@@ -227,21 +233,55 @@ Or pass any command directly:
 
 ---
 
-## Monitored Folders (Dynamic Resolution)
+## Monitored Folders & Cloud Storage
 
-The watcher monitors standard user directories across all operating systems:
+The watcher automatically detects standard user media folders, cloud sync folders, and custom user-specified directories across all operating systems:
+- `Pictures` / `Photos`
+- `Videos` / `Movies`
 - `Downloads`
-- `Pictures`
 - `Desktop`
 - `Documents`
 - `Music`
-- `Movies` *(macOS)* / `Videos` *(Windows & Linux)*
+- **Cloud Folders**:
+  - **Google Drive**: `G:\`, `G:\My Drive`, `~/Google Drive`, `~/Google Photos`
+  - **OneDrive**: `Pictures`, `Camera Roll`
+  - **iCloud Photos**: `iCloud Photos\Photos`
 
-On Windows, directories are dynamically resolved via Windows Shell API & Registry (handling custom drive paths and OneDrive redirection). On macOS and Linux, standard user directories are automatically resolved.
+### Custom Directories (`watch_dirs.txt`)
+Need to watch external SSDs, SD cards, or custom folders?
+1. Open or create `watch_dirs.txt` in the root repository folder (or select `[8] Manage Watched Folders` in `GoogleUnlimited.bat`).
+2. Add one folder path per line (environment variables like `%USERPROFILE%` or `$HOME` are fully supported):
+   ```text
+   # Custom storage drives
+   D:\CameraRoll
+   E:\SonyA7IV_Raw
+   %USERPROFILE%\Pictures\Lightroom
+   ```
+3. You can also specify directories directly on launch:
+   ```cmd
+   GoogleUnlimited.bat watch "D:\Photos" "E:\Videos"
+   ```
+   ```bash
+   ./google-unlimited.sh watch /Volumes/ExternalSSD/Photos
+   ```
 
-### Supported File Extensions
-- **Images**: `.jpg`, `.jpeg`, `.png`, `.heic`, `.webp`, `.gif`, `.dng`
-- **Videos**: `.mp4`, `.mov`, `.mkv`, `.avi`
+### Supported Media Formats (37 Formats)
+- **Standard Images**: `.jpg`, `.jpeg`, `.png`, `.heic`, `.heif`, `.webp`, `.gif`, `.bmp`, `.tiff`, `.tif`, `.jfif`, `.avif`
+- **Camera RAW (DSLR & Mirrorless)**: `.dng`, `.cr2`, `.cr3` (Canon), `.nef` (Nikon), `.arw` (Sony), `.raw`, `.orf` (Olympus), `.rw2` (Panasonic), `.pef` (Pentax), `.srw` (Samsung), `.raf` (Fujifilm)
+- **Videos**: `.mp4`, `.mov` (Apple QuickTime/iPhone), `.mkv`, `.avi`, `.m4v`, `.3gp`, `.3g2`, `.wmv`, `.webm`, `.flv`, `.mts`, `.m2ts`, `.ts`, `.mpg`
+
+---
+
+## Real-Time Detection & Safety Sweeps
+
+- **Instant Real-Time Monitoring**:
+  - **Windows**: Uses .NET `FileSystemWatcher` listening to `Created`, `Renamed`, and `Changed` events with buffer expansion (64 KB) and debouncing (1.5s window).
+  - **macOS / Linux**: Uses `fswatch` or `inotifywait` with low-latency streaming event loops.
+- **Full Historical Scan & Safety Sweep**:
+  - Upon startup (Phase 1), every monitored folder is traversed to sync any previously existing media files.
+  - Background safety sweeps run every 30 seconds to catch any files transferred while the watcher was paused or during offline camera imports.
+- **Accurate Content-Hash Deduplication**:
+  - Unlike naive filename/size matching, GoogleUnlimited verifies the SHA-256 hash against `gphotos.db`, ensuring no duplicate uploads while never discarding different photos that happen to share standard filenames (e.g., `IMG_0001.JPG`) and byte sizes.
 
 ---
 

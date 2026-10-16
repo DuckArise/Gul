@@ -8,7 +8,8 @@ $testFiles = @(
     "test_quoting.ps1",
     "test_deadlock.ps1",
     "test_dedup.ps1",
-    "test_persistence.ps1"
+    "test_persistence.ps1",
+    "test_watch_folders_and_ext.ps1"
 )
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
