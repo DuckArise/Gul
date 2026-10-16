@@ -347,6 +347,7 @@ do_setup() {
             else
                 echo -e "${RED}[ERROR] Homebrew (brew) is not installed.${NC}"
                 echo "Please install Homebrew by running:"
+                # shellcheck disable=SC2016
                 echo '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
                 echo "Then run: brew install ${missing[*]}"
                 exit 1
@@ -434,7 +435,9 @@ do_setup() {
         else
             verify_binary "$target_bin" || true
         fi
-        [ -s "$target_bin" ] && chmod 700 "$target_bin" 2>/dev/null || true
+        if [ -s "$target_bin" ]; then
+            chmod 700 "$target_bin" 2>/dev/null || true
+        fi
     fi
 
     # Set execution permissions on scripts and binaries
