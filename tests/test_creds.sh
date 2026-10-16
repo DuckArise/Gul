@@ -27,11 +27,12 @@ assert_output_contains() {
 }
 
 # 1. Missing token returns error
-OUT1="$(./google-unlimited.sh creds add - </dev/null 2>&1 || true)"
+APP_CMD="bash $SCRIPT_DIR/google-unlimited.sh"
+OUT1="$($APP_CMD creds add - </dev/null 2>&1 || true)"
 assert_output_contains "Empty stdin to 'creds add -' outputs error" "$OUT1" "No OAuth token provided"
 
 # 2. Positional argument triggers security deprecation warning
-OUT2="$(./google-unlimited.sh creds add "dummy_secret_token_12345" 2>&1 || true)"
+OUT2="$($APP_CMD creds add "dummy_secret_token_12345" 2>&1 || true)"
 assert_output_contains "Positional token triggers security warning" "$OUT2" "SECURITY WARNING"
 assert_output_contains "Warning advises interactive prompt or stdin" "$OUT2" "creds add -"
 
@@ -45,7 +46,7 @@ else
 fi
 
 # 4. Standard input pipe mode (echo token | creds add -) accepts input without argument exposure
-OUT3="$(printf "test_mock_token\n" | ./google-unlimited.sh creds add - 2>&1 || true)"
+OUT3="$(printf "test_mock_token\n" | $APP_CMD creds add - 2>&1 || true)"
 if echo "$OUT3" | grep -q "SECURITY WARNING"; then
     echo -e "  \033[0;31m[FAIL]\033[0m Stdin pipe mode triggered deprecation warning!"
     FAILED=$((FAILED + 1))

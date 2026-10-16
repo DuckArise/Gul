@@ -59,30 +59,11 @@ jobs:
       - name: Install Dependencies
         run: sudo apt-get update && sudo apt-get install -y sqlite3 inotify-tools curl
 
-      - name: Run Test - File Readiness (BUG-01)
-        run: |
-          chmod +x tests/test_readiness.sh
-          ./tests/test_readiness.sh
+      - name: Set Executable Permissions
+        run: chmod +x google-unlimited.sh tests/*.sh
 
-      - name: Run Test - Token Protection (SEC-01)
-        run: |
-          chmod +x tests/test_creds.sh
-          ./tests/test_creds.sh
-
-      - name: Run Test - Deduplication Collision (BUG-05)
-        run: |
-          chmod +x tests/test_dedup.sh
-          ./tests/test_dedup.sh
-
-      - name: Run Test - SQLite & WAL Permissions (SEC-03)
-        run: |
-          chmod +x tests/test_permissions.sh
-          ./tests/test_permissions.sh
-
-      - name: Run Test - Safe Process Termination (REL-02)
-        run: |
-          chmod +x tests/test_process_stop.sh
-          ./tests/test_process_stop.sh
+      - name: Run All Linux Tests
+        run: ./tests/run_all_tests.sh
 
   test-windows:
     name: Windows Regression Tests (PowerShell)
@@ -92,25 +73,9 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Run Test - File Readiness (BUG-01)
+      - name: Run All Windows Tests
         shell: pwsh
-        run: ./tests/test_readiness.ps1
-
-      - name: Run Test - Argument Quoting (BUG-03)
-        shell: pwsh
-        run: ./tests/test_quoting.ps1
-
-      - name: Run Test - Pipe Deadlock Elimination (BUG-02)
-        shell: pwsh
-        run: ./tests/test_deadlock.ps1
-
-      - name: Run Test - Deduplication Collision (BUG-05)
-        shell: pwsh
-        run: ./tests/test_dedup.ps1
-
-      - name: Run Test - Persistence & Consistency (BUG-04)
-        shell: pwsh
-        run: ./tests/test_persistence.ps1
+        run: ./tests/run_all_tests.ps1
 
   test-macos:
     name: macOS Regression Tests (macOS)
@@ -120,9 +85,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Run Bash Scripts Validation on macOS
+      - name: Set Executable Permissions
+        run: chmod +x google-unlimited.sh tests/*.sh
+
+      - name: Run macOS Regression Tests
         run: |
-          chmod +x tests/*.sh
           ./tests/test_readiness.sh
           ./tests/test_creds.sh
           ./tests/test_dedup.sh
